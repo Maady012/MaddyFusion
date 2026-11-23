@@ -1,0 +1,106 @@
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+
+import { keywordFiltersApi, type KeywordSyncStatus } from '@/lib/api'
+
+export const keywordFilterKeys = {
+  all: ['keyword-filters'] as const,
+  syncStatus: () => [...keywordFilterKeys.all, 'sync-status'] as const,
+  keywords: (params?: { page?: number; page_size?: number; search?: string; scope?: string }) =>
+    [...keywordFilterKeys.all, 'keywords', params] as const,
+  whitelist: (params?: { page?: number; page_size?: number }) =>
+    [...keywordFilterKeys.all, 'whitelist', params] as const,
+}
+
+export function useKeywordFilters(params?: { page?: number; page_size?: number; search?: string; scope?: string }) {
+  return useQuery({
+    queryKey: keywordFilterKeys.keywords(params),
+    queryFn: () => keywordFiltersApi.listKeywords(params),
+  })
+}
+
+export function useKeywordWhitelist(params?: { page?: number; page_size?: number }) {
+  return useQuery({
+    queryKey: keywordFilterKeys.whitelist(params),
+    queryFn: () => keywordFiltersApi.listWhitelist(params),
+  })
+}
+
+export function useAddKeyword() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ keyword, scope }: { keyword: string; scope?: string }) =>
+      keywordFiltersApi.addKeyword(keyword, scope),
+    onSuccess: () => qc.invalidateQueries({ queryKey: keywordFilterKeys.all }),
+  })
+}
+
+export function useToggleKeyword() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, is_active }: { id: number; is_active: boolean }) =>
+      keywordFiltersApi.toggleKeyword(id, is_active),
+    onSuccess: () => qc.invalidateQueries({ queryKey: keywordFilterKeys.all }),
+  })
+}
+
+export function useUpdateKeywordScope() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, scope }: { id: number; scope: string }) => keywordFiltersApi.updateKeywordScope(id, scope),
+    onSuccess: () => qc.invalidateQueries({ queryKey: keywordFilterKeys.all }),
+  })
+}
+
+export function useDeleteKeyword() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => keywordFiltersApi.deleteKeyword(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: keywordFilterKeys.all }),
+  })
+}
+
+export function useAddWhitelistPhrase() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ phrase, reason }: { phrase: string; reason?: string }) =>
+      keywordFiltersApi.addWhitelistPhrase(phrase, reason),
+    onSuccess: () => qc.invalidateQueries({ queryKey: keywordFilterKeys.all }),
+  })
+}
+
+export function useDeleteWhitelistPhrase() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => keywordFiltersApi.deleteWhitelistPhrase(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: keywordFilterKeys.all }),
+  })
+}
+
+export function useReloadKeywordCache() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: () => keywordFiltersApi.reloadCache(),
+    onSuccess: () => qc.invalidateQueries({ queryKey: keywordFilterKeys.all }),
+  })
+}
+
+export function useKeywordSyncStatus(options?: { enabled?: boolean }) {
+  return useQuery({
+    queryKey: keywordFilterKeys.syncStatus(),
+    queryFn: () => keywordFiltersApi.getSyncStatus(),
+    enabled: options?.enabled !== false,
+    refetchInterval: (query) => {
+      const data = query.state.data as KeywordSyncStatus | undefined
+      const active = data?.recompute.in_progress
+      return active ? 5_000 : 30_000
+    },
+  })
+}
+
+export function useResetKeywordFilters() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: () => keywordFiltersApi.resetToDefaults(),
+    onSuccess: () => qc.invalidateQueries({ queryKey: keywordFilterKeys.all }),
+  })
+}

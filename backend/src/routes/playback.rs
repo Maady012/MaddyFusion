@@ -1,0 +1,1271 @@
+/// Streaming provider playback proxy.
+///
+/// Routes:
+///   GET|HEAD /{secret_str}/playback/{provider_name}/{info_hash}
+///   GET /{secret_str}/playback/{provider_name}/{info_hash}/{filename}
+///   GET /{secret_str}/playback/{provider_name}/{info_hash}/{season}/{episode}
+///   GET /{secret_str}/playback/{provider_name}/{info_hash}/{season}/{episode}/{filename}
+///
+/// Flow:
+///   1. Decrypt secret_str → UserData → find provider token
+///   2. Check Redis cache for previously resolved URL
+///   3. Fetch stream announce list from DB
+///   4. Call provider-specific resolver (currently: Real-Debrid)
+///   5. Cache result → 302 redirect to direct video URL
+///   6. On any error → 302 to static error video
+use std::sync::Arc;
+
+use axum::{
+    body::Body,
+    extract::{Path, State},
+    http::{HeaderMap, Method, StatusCode, header},
+    response::{IntoResponse, Response},
+};
+use fred::prelude::{Expiration, KeysInterface};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+
+use crate::{
+    crypto, db, models::user_data::UserData, parser::episode_detector::is_video_file, providers,
+    providers::torrents::metadata_update::ProviderFile, routes::playback_dedup,
+    services::sync::spawn_playback_scrobble, state::AppState,
+};
+
+const URL_CACHE_TTL: i64 = 3600;
+
+// ─── Route path extractors ────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct PlaybackPath {
+    pub secret_str: String,
+    pub provider_name: String,
+    pub info_hash: String,
+}
+
+#[derive(Deserialize)]
+pub struct PlaybackPathWithFilename {
+    pub secret_str: String,
+    pub provider_name: String,
+    pub info_hash: String,
+    pub filename: String,
+}
+
+#[derive(Deserialize)]
+pub struct PlaybackPathSeEp {
+    pub secret_str: String,
+    pub provider_name: String,
+    pub info_hash: String,
+    pub season: i32,
+    pub episode: i32,
+}
+
+#[derive(Deserialize)]
+pub struct PlaybackPathSeEpFilename {
+    pub secret_str: String,
+    pub provider_name: String,
+    pub info_hash: String,
+    pub season: i32,
+    pub episode: i32,
+    pub filename: String,
+}
+
+// ─── Handlers ─────────────────────────────────────────────────────────────────
+
+pub async fn handler_base(
+    method: Method,
+    headers: HeaderMap,
+    Path(p): Path<PlaybackPath>,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    dispatch(
+        method,
+        headers,
+        state,
+        p.secret_str,
+        p.provider_name,
+        p.info_hash,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+pub async fn handler_with_filename(
+    method: Method,
+    headers: HeaderMap,
+    Path(p): Path<PlaybackPathWithFilename>,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    dispatch(
+        method,
+        headers,
+        state,
+        p.secret_str,
+        p.provider_name,
+        p.info_hash,
+        None,
+        None,
+        Some(p.filename),
+    )
+    .await
+}
+
+pub async fn handler_seep(
+    method: Method,
+    headers: HeaderMap,
+    Path(p): Path<PlaybackPathSeEp>,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    dispatch(
+        method,
+        headers,
+        state,
+        p.secret_str,
+        p.provider_name,
+        p.info_hash,
+        Some(p.season),
+        Some(p.episode),
+        None,
+    )
+    .await
+}
+
+pub async fn handler_seep_filename(
+    method: Method,
+    headers: HeaderMap,
+    Path(p): Path<PlaybackPathSeEpFilename>,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    dispatch(
+        method,
+        headers,
+        state,
+        p.secret_str,
+        p.provider_name,
+        p.info_hash,
+        Some(p.season),
+        Some(p.episode),
+        Some(p.filename),
+    )
+    .await
+}
+
+// ─── Core logic ───────────────────────────────────────────────────────────────
+
+async fn dispatch(
+    method: Method,
+    headers: HeaderMap,
+    state: Arc<AppState>,
+    secret_str: String,
+    provider_name: String,
+    info_hash: String,
+    season: Option<i32>,
+    episode: Option<i32>,
+    filename: Option<String>,
+) -> Response {
+    let (info_hash, season, episode, filename) = if info_hash.starts_with("T-") {
+        let Some(reference) = crypto::torrent_ref::open(&info_hash, &state.config.secret_key)
+            .filter(|reference| {
+                reference.scope == crypto::torrent_ref::scope(&secret_str, &provider_name)
+            })
+        else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        (
+            reference.hash,
+            reference.season,
+            reference.episode,
+            reference.filename,
+        )
+    } else {
+        (info_hash, season, episode, filename)
+    };
+    let info_hash = info_hash.to_lowercase();
+
+    let resolve_fut = resolve(
+        Arc::clone(&state),
+        &secret_str,
+        &provider_name,
+        &info_hash,
+        season,
+        episode,
+        filename.as_deref(),
+        method != Method::HEAD,
+    );
+
+    let resolved = if method == Method::HEAD {
+        match tokio::time::timeout(playback_dedup::HEAD_RESOLVE_BUDGET, resolve_fut).await {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::debug!(
+                    provider = %provider_name,
+                    hash = %info_hash,
+                    "playback HEAD budget exceeded; releasing lock for follow-up GET"
+                );
+                Err(playback_dedup::playback_resolve_timed_out())
+            }
+        }
+    } else {
+        resolve_fut.await
+    };
+
+    let video_url = match resolved {
+        Ok(url) => url,
+        Err(e) => {
+            let kind = match &e {
+                providers::ProviderError::Http(_) => "http",
+                providers::ProviderError::Api { .. } => "api",
+                providers::ProviderError::Json(_) => "json",
+                providers::ProviderError::Other(_) => "other",
+            };
+            let msg = format!("playback [{kind}] provider={provider_name} hash={info_hash}");
+            e.log(&msg);
+            error_video_url(&state, e.video_file())
+        }
+    };
+
+    resolved_playback_response(
+        &state,
+        method,
+        video_url,
+        &headers,
+        &info_hash,
+        &provider_name,
+    )
+    .await
+}
+
+/// Apply the privacy policy only after resolving a provider-owned destination.
+pub async fn resolved_playback_response(
+    state: &AppState,
+    method: Method,
+    video_url: String,
+    headers: &HeaderMap,
+    info_hash: &str,
+    provider: &str,
+) -> Response {
+    if state.config.hide_torrent_info_hashes
+        && (crate::torrent_privacy_middleware::contains_hash(&video_url)
+            || video_url.to_ascii_lowercase().contains(info_hash))
+    {
+        tracing::info!(
+            provider,
+            relay = state.config.hide_torrent_info_hashes_relay,
+            "hash-bearing provider destination: playback relay policy applied"
+        );
+        if state.config.hide_torrent_info_hashes_relay {
+            return private_video_response(&state.debrid_http, method, &video_url, headers).await;
+        }
+        let mut response = playback_redirect(method, video_url);
+        response
+            .extensions_mut()
+            .insert(crate::torrent_privacy_middleware::AllowProviderRedirect);
+        return response;
+    }
+    playback_redirect(method, video_url)
+}
+
+/// Rare provider URLs include a hash (often in the physical filename). Relay
+/// their bytes rather than revealing that URL in Location. Preserve byte ranges.
+pub async fn private_video_response(
+    http: &reqwest::Client,
+    method: Method,
+    url: &str,
+    headers: &HeaderMap,
+) -> Response {
+    let mut request = http
+        .request(method.clone(), url)
+        .timeout(std::time::Duration::from_secs(86_400));
+    for name in [header::RANGE, header::IF_RANGE] {
+        if let Some(value) = headers.get(&name) {
+            request = request.header(name, value);
+        }
+    }
+    let Ok(upstream) = request.send().await else {
+        return StatusCode::BAD_GATEWAY.into_response();
+    };
+    // Provider/CDN error pages can echo the original URL or filename. Never
+    // stream textual responses or upstream errors through the video relay.
+    if !upstream.status().is_success()
+        || upstream
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(crate::torrent_privacy_middleware::textual_content_type)
+    {
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
+    let mut response = Response::builder()
+        .status(upstream.status())
+        .header(header::CACHE_CONTROL, "private, no-store");
+    for name in [
+        header::CONTENT_TYPE,
+        header::CONTENT_LENGTH,
+        header::CONTENT_RANGE,
+        header::ACCEPT_RANGES,
+        header::LAST_MODIFIED,
+    ] {
+        if let Some(value) = upstream.headers().get(&name) {
+            response = response.header(name, value);
+        }
+    }
+    response
+        .body(if method == Method::HEAD {
+            Body::empty()
+        } else {
+            Body::from_stream(upstream.bytes_stream())
+        })
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+fn provider_resolve_budget(
+    provider: &crate::models::user_data::StreamingProvider,
+) -> playback_dedup::ResolveBudget {
+    playback_dedup::ResolveBudget {
+        holder: if provider.service == "qbittorrent" {
+            provider
+                .qbittorrent_config
+                .as_ref()
+                .map(providers::torrents::qbittorrent::resolve_timeout)
+                .unwrap_or_else(playback_dedup::holder_resolve_timeout)
+        } else {
+            playback_dedup::holder_resolve_timeout()
+        },
+    }
+}
+
+async fn resolve(
+    state: Arc<AppState>,
+    secret_str: &str,
+    provider_name: &str,
+    info_hash: &str,
+    season: Option<i32>,
+    episode: Option<i32>,
+    filename: Option<&str>,
+    track_playback: bool,
+) -> Result<String, providers::ProviderError> {
+    // 1. Decrypt user config
+    let raw_user_data = crypto::resolve_user_data(
+        secret_str,
+        &state.config.secret_key,
+        &state.pool,
+        &state.redis,
+    )
+    .await
+    .map_err(|e| providers::ProviderError::api(e.to_string(), "invalid_config.mp4"))?;
+    let user_data: UserData = serde_json::from_value(raw_user_data).unwrap_or_default();
+
+    // 2. Find provider
+    let provider = user_data
+        .get_provider_by_name(provider_name)
+        .or_else(|| user_data.get_primary_provider())
+        .ok_or_else(|| {
+            providers::ProviderError::api("No streaming provider configured", "api_error.mp4")
+        })?;
+
+    // For PikPak with email+password: capture credentials and profile location now,
+    // while `provider` is still in scope, so the pikpak match arm can re-login if needed.
+    let pikpak_credentials: Option<(String, String)> = if provider.service == "pikpak" {
+        match (provider.email.clone(), provider.password.clone()) {
+            (Some(e), Some(p)) => Some((e, p)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let pikpak_profile_id = user_data.profile_id;
+    let pikpak_provider_index: Option<usize> = if provider.service == "pikpak" {
+        user_data
+            .streaming_providers
+            .iter()
+            .position(|p| p.service == "pikpak")
+    } else {
+        None
+    };
+
+    // PikPak: resolve session token (login, migrate legacy tokens, or use stored token).
+    let resolved_token: Option<String> = if provider.service == "pikpak" {
+        Some(
+            pikpak_resolve_token(
+                &state,
+                provider,
+                pikpak_credentials.as_ref(),
+                pikpak_profile_id,
+                pikpak_provider_index,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let token: &str = if let Some(ref t) = resolved_token {
+        t.as_str()
+    } else if provider.uses_api_token() {
+        provider.token.as_deref().ok_or_else(|| {
+            providers::ProviderError::api("Provider token is missing", "invalid_token.mp4")
+        })?
+    } else {
+        ""
+    };
+
+    let record_playback = {
+        let pool = state.pool.clone();
+        let hash = info_hash.to_string();
+        let user_id = user_data.user_id.map(|u| u.0);
+        let profile_id = user_data.profile_id.map(|p| p.0);
+        let pname = provider_name.to_string();
+        let pservice = provider.service.clone();
+        let s = season;
+        let e = episode;
+        move || {
+            if track_playback {
+                db::spawn_track_stream_playback_by_hash(
+                    pool,
+                    hash,
+                    user_id,
+                    profile_id,
+                    s,
+                    e,
+                    Some(pname),
+                    Some(pservice),
+                );
+            }
+        }
+    };
+
+    // 3. Restriction check: block playback if all media linked to this torrent is restricted.
+    // Admins/moderators may still play for review (matches catalog stream visibility rules).
+    let bypass_restriction = if let Some(uid) = user_data.user_id {
+        db::get_user_role(&state.pool_ro, uid.0)
+            .await
+            .is_some_and(db::is_mod_or_admin)
+    } else {
+        false
+    };
+    if !bypass_restriction && crate::state::info_hash_is_restricted(&state.pool_ro, info_hash).await
+    {
+        return Err(providers::ProviderError::api(
+            "Content is restricted",
+            "restricted.mp4",
+        ));
+    }
+
+    let budget = provider_resolve_budget(provider);
+
+    // 4. Check Redis cache, then deduplicate concurrent resolution.
+    let cache_key = playback_cache_key(
+        secret_str,
+        provider_name,
+        info_hash,
+        season,
+        episode,
+        filename,
+    );
+    if let Some(cached) =
+        try_cached_playback_url(&state, &cache_key, info_hash, season, episode).await
+    {
+        return Ok(cached);
+    }
+
+    match playback_dedup::prepare_resolve_with_budget(&state.redis, &cache_key, budget).await {
+        playback_dedup::DedupWaitResult::Cached(url) => {
+            if playback_metadata_needs_refresh(&state.pool_ro, info_hash, season, episode).await {
+                tracing::info!(
+                    hash = %info_hash,
+                    season = ?season,
+                    episode = ?episode,
+                    "playback dedup cache bypassed — file metadata still looks like a scraper stub"
+                );
+                let _ = state.redis.del::<(), _>(&cache_key).await;
+            } else {
+                return Ok(url);
+            }
+        }
+        playback_dedup::DedupWaitResult::TimedOut => {
+            tracing::debug!(
+                provider = %provider_name,
+                hash = %info_hash,
+                "playback resolve timed out waiting for in-flight peer; retrying lock"
+            );
+            match playback_dedup::try_ready_after_wait(&state.redis, &cache_key).await {
+                playback_dedup::DedupWaitResult::Cached(url) => {
+                    if playback_metadata_needs_refresh(&state.pool_ro, info_hash, season, episode)
+                        .await
+                    {
+                        let _ = state.redis.del::<(), _>(&cache_key).await;
+                    } else {
+                        return Ok(url);
+                    }
+                }
+                playback_dedup::DedupWaitResult::ReadyToResolve => {}
+                playback_dedup::DedupWaitResult::TimedOut => {
+                    return Err(playback_dedup::playback_resolve_timed_out());
+                }
+            }
+        }
+        playback_dedup::DedupWaitResult::ReadyToResolve => {}
+    }
+
+    let lock_guard =
+        playback_dedup::acquire_resolve_lock_with_budget(&state.redis, &cache_key, budget)
+            .await
+            .ok_or_else(playback_dedup::playback_resolve_timed_out)?;
+
+    if let Some(cached) =
+        try_cached_playback_url(&state, &cache_key, info_hash, season, episode).await
+    {
+        lock_guard.release().await;
+        return Ok(cached);
+    }
+
+    let resolve_started = std::time::Instant::now();
+    tracing::info!(
+        provider = %provider_name,
+        hash = %info_hash,
+        "starting playback provider resolve"
+    );
+
+    let result = match tokio::time::timeout(
+        budget.holder,
+        resolve_playback_url(
+            &state,
+            info_hash,
+            season,
+            episode,
+            filename,
+            provider,
+            token,
+            pikpak_credentials.as_ref(),
+            pikpak_profile_id,
+            pikpak_provider_index,
+            &user_data,
+        ),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => {
+            tracing::debug!(
+                provider = %provider_name,
+                hash = %info_hash,
+                "playback provider resolve timed out"
+            );
+            Err(playback_dedup::playback_resolve_timed_out())
+        }
+    };
+
+    if result
+        .as_ref()
+        .is_err_and(providers::ProviderError::should_quarantine_hash)
+        && providers::torrents::metadata_update::quarantine_stream(
+            &state.pool,
+            Some(&state.redis),
+            info_hash,
+        )
+        .await
+    {
+        tracing::warn!(
+            provider = %provider_name,
+            hash = %info_hash,
+            "quarantined torrent after provider confirmed it contains no playable video files"
+        );
+    }
+
+    tracing::info!(
+        provider = %provider_name,
+        hash = %info_hash,
+        elapsed_ms = resolve_started.elapsed().as_millis(),
+        success = result.is_ok(),
+        "finished playback provider resolve"
+    );
+
+    if let Ok(ref url) = result {
+        set_playback_cache(&state.redis, &cache_key, url).await;
+        crate::providers::torrents::cache::store_cached_hashes_for_provider(
+            &state.redis,
+            Some(&state.http),
+            provider,
+            &[info_hash.to_string()],
+            state.config.sync_debrid_cache_streams,
+            &state.config.mediafusion_url,
+            state.config.store_stremthru_magnet_cache,
+        )
+        .await;
+
+        // Count plays only when the provider freshly resolves a URL (not cache hits).
+        record_playback();
+
+        if let Some(profile_id) = user_data.profile_id {
+            spawn_playback_scrobble(
+                Arc::clone(&state),
+                profile_id.0,
+                info_hash.to_string(),
+                season,
+                episode,
+            );
+        }
+    }
+    lock_guard.release().await;
+    result
+}
+
+/// Resolve a stored torrent through a debrid provider using the primary DB
+/// for the initial hash lookup to avoid read-replica replication lag.
+async fn resolve_playback_url(
+    state: &AppState,
+    info_hash: &str,
+    season: Option<i32>,
+    episode: Option<i32>,
+    filename: Option<&str>,
+    provider: &crate::models::user_data::StreamingProvider,
+    token: &str,
+    pikpak_credentials: Option<&(String, String)>,
+    pikpak_profile_id: Option<crate::db::ProfileId>,
+    pikpak_provider_index: Option<usize>,
+    user_data: &UserData,
+) -> Result<String, providers::ProviderError> {
+    // Fetch stream info from DB (announce list, file_index, filename hint)
+    let stream_info = db::fetch_stream_playback_info(&state.pool, info_hash, season, episode)
+        .await
+        .ok_or_else(|| providers::ProviderError::api("Stream not found", "stream_not_found.mp4"))?;
+
+    let resolved_filename = filename.or(stream_info.filename.as_deref());
+
+    // Build a MediaFlow forward transport when the user has a non-local proxy configured.
+    // When the proxy URL is loopback/private the addon and MediaFlow share an IP, so
+    // routing debrid API calls through it would not help — use direct calls instead.
+    let forward = user_data.mediaflow_config.as_ref().and_then(|cfg| {
+        let proxy_url = cfg.proxy_url.as_deref()?;
+        let api_password = cfg.api_password.as_deref()?;
+        if providers::torrents::transport::MediaFlowForward::is_local(proxy_url) {
+            None
+        } else {
+            Some(providers::torrents::transport::MediaFlowForward::new(
+                proxy_url,
+                api_password,
+            ))
+        }
+    });
+    let fwd = forward.as_ref();
+
+    let http = state.debrid_http_for_provider(&provider.service);
+
+    // Dispatch to provider — realdebrid returns (url, files); others just url.
+    //
+    // Only providers where forward IS fully wired (api calls routed through MediaFlow)
+    // AND whose API resolves the download URL server-side receive "{mediaflow_ip}" as user_ip.
+    // MediaFlow substitutes that placeholder with its actual public IP before forwarding.
+    //
+    // Providers with _forward (ignored) make direct API calls, so passing a placeholder
+    // would send the literal string "{mediaflow_ip}" to the debrid API — always None there.
+    macro_rules! call_provider_simple {
+        ($module:path) => {{
+            use $module as p;
+            let url = p::get_video_url(
+                http,
+                token,
+                info_hash,
+                &stream_info.announce_list,
+                resolved_filename,
+                stream_info.file_index,
+                season,
+                episode,
+                None,
+                fwd,
+            )
+            .await?;
+            (url, Vec::<ProviderFile>::new())
+        }};
+    }
+
+    macro_rules! call_provider_with_torrent_file {
+        ($module:path) => {{
+            use $module as p;
+            let url = p::get_video_url(
+                http,
+                token,
+                info_hash,
+                &stream_info.announce_list,
+                resolved_filename,
+                stream_info.file_index,
+                season,
+                episode,
+                None,
+                stream_info.torrent_file.as_deref(),
+                Some(stream_info.name.as_str()),
+                fwd,
+            )
+            .await?;
+            (url, Vec::<ProviderFile>::new())
+        }};
+    }
+
+    // ip= hint: only for providers with fully wired forward transport.
+    let ip_hint = |has_ip_hint: bool| -> Option<&str> {
+        if has_ip_hint && fwd.is_some() {
+            Some("{mediaflow_ip}")
+        } else {
+            None
+        }
+    };
+
+    let (video_url, provider_files): (String, Vec<ProviderFile>) = match provider.service.as_str() {
+        "realdebrid" => {
+            // forward wired + ip= form field supported
+            providers::torrents::realdebrid::get_video_url(
+                http,
+                token,
+                info_hash,
+                &stream_info.announce_list,
+                resolved_filename,
+                stream_info.file_index,
+                season,
+                episode,
+                ip_hint(true),
+                stream_info.torrent_file.as_deref(),
+                Some(stream_info.name.as_str()),
+                fwd,
+            )
+            .await?
+        }
+        "alldebrid" => {
+            // forward wired + ip= query/body supported
+            use providers::torrents::alldebrid as p;
+            let url = p::get_video_url(
+                http,
+                token,
+                info_hash,
+                &stream_info.announce_list,
+                resolved_filename,
+                stream_info.file_index,
+                season,
+                episode,
+                ip_hint(true),
+                stream_info.torrent_file.as_deref(),
+                Some(stream_info.name.as_str()),
+                fwd,
+            )
+            .await?;
+            (url, Vec::<ProviderFile>::new())
+        }
+        // Providers below make API calls through forward when wired.
+        "premiumize" => call_provider_with_torrent_file!(providers::torrents::premiumize),
+        // debridlink: forward wired for API calls; its direct download URL stays unchanged.
+        "debridlink" => call_provider_with_torrent_file!(providers::torrents::debridlink),
+        "torbox" => {
+            // `requestdl?redirect=true` is opened by the player itself. Do not send
+            // MediaFlow's IP as user_ip: that pins TorBox to a CDN edge near the
+            // proxy even though direct Stremio playback fetches bytes elsewhere.
+            use providers::torrents::torbox as p;
+            p::get_video_url(
+                http,
+                token,
+                info_hash,
+                &stream_info.announce_list,
+                resolved_filename,
+                stream_info.file_index,
+                season,
+                episode,
+                stream_info.torrent_file.as_deref(),
+                Some(stream_info.name.as_str()),
+                fwd,
+            )
+            .await?
+        }
+        "stremthru" => call_provider_simple!(providers::torrents::stremthru),
+        "torrin" => call_provider_simple!(providers::torrents::torrin),
+        "offcloud" => call_provider_simple!(providers::torrents::offcloud),
+        // easydebrid: forward wired; X-Forwarded-For is stripped by /proxy/forward — None for user_ip
+        "easydebrid" => call_provider_simple!(providers::torrents::easydebrid),
+        "seedr" => {
+            use providers::torrents::seedr as p;
+            let url = p::get_video_url(
+                http,
+                token,
+                info_hash,
+                &stream_info.announce_list,
+                resolved_filename,
+                stream_info.file_index,
+                season,
+                episode,
+                stream_info.size_bytes,
+                stream_info.torrent_file.as_deref(),
+                Some(stream_info.name.as_str()),
+                None,
+                fwd,
+            )
+            .await?;
+            (url, Vec::<ProviderFile>::new())
+        }
+        "pikpak" => {
+            use providers::torrents::pikpak as p;
+            let first = p::get_video_url(
+                http,
+                token,
+                info_hash,
+                &stream_info.announce_list,
+                resolved_filename,
+                stream_info.file_index,
+                season,
+                episode,
+                stream_info.size_bytes,
+                None,
+                fwd,
+            )
+            .await;
+            match first {
+                Ok(url) => (url, Vec::new()),
+                Err(e) if e.video_file() == "invalid_token.mp4" => {
+                    // Access token expired and refresh token is invalid — re-login once.
+                    let (email, password) = pikpak_credentials.ok_or_else(|| {
+                        providers::ProviderError::api(
+                            "PikPak token expired and no credentials available to re-authenticate.",
+                            "invalid_credentials.mp4",
+                        )
+                    })?;
+                    tracing::debug!("PikPak token expired; re-logging in with email+password");
+                    let new_token = p::login(&state.http, email, password).await?;
+                    pikpak_save_token(
+                        state,
+                        &new_token,
+                        email,
+                        password,
+                        pikpak_profile_id,
+                        pikpak_provider_index,
+                    )
+                    .await;
+                    let url = p::get_video_url(
+                        http,
+                        &new_token,
+                        info_hash,
+                        &stream_info.announce_list,
+                        resolved_filename,
+                        stream_info.file_index,
+                        season,
+                        episode,
+                        stream_info.size_bytes,
+                        None,
+                        fwd,
+                    )
+                    .await?;
+                    (url, Vec::new())
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        "debrider" => {
+            let magnet = build_magnet_link(info_hash, &stream_info.announce_list);
+            let (url, files) = providers::torrents::debrider::get_video_url_with_files(
+                http,
+                token,
+                &magnet,
+                &stream_info.name,
+                resolved_filename,
+                season,
+                episode,
+                ip_hint(true),
+                fwd,
+            )
+            .await?;
+            (url, files)
+        }
+        "qbittorrent" => {
+            let cfg = provider.qbittorrent_config.as_ref().ok_or_else(|| {
+                providers::ProviderError::api(
+                    "qBittorrent configuration missing",
+                    "invalid_config.mp4",
+                )
+            })?;
+            let magnet = build_magnet_link(info_hash, &stream_info.announce_list);
+            let is_private = !matches!(
+                stream_info.torrent_type,
+                crate::db::TorrentType::Public | crate::db::TorrentType::WebSeed
+            );
+            let url = providers::torrents::qbittorrent::get_video_url(
+                http,
+                cfg,
+                info_hash,
+                &state.redis,
+                &magnet,
+                &stream_info.name,
+                resolved_filename,
+                season,
+                episode,
+                stream_info.torrent_file.as_deref(),
+                is_private,
+            )
+            .await?;
+            (url, Vec::new())
+        }
+        other => {
+            return Err(providers::ProviderError::api(
+                format!("Provider '{other}' is not yet supported in the Rust service"),
+                "provider_error.mp4",
+            ));
+        }
+    };
+
+    // Re-resolve and store file metadata in the background (future users benefit) when
+    // the DB's view of this torrent looks incomplete relative to what the provider just
+    // returned: this episode isn't mapped yet, its filename was never recorded, or the
+    // provider reports more files than we have stored (e.g. a scraper stub for a single
+    // episode of what's actually a multi-file torrent).
+    let no_file_metadata = stream_info.has_no_files
+        || stream_info.file_index.is_some_and(|index| index < 0)
+        || stream_info.filename.as_deref().is_none_or(str::is_empty)
+        || provider_files.len() > stream_info.total_files as usize;
+    if no_file_metadata && !provider_files.is_empty() {
+        tracing::info!(
+            hash = %info_hash,
+            provider_files = provider_files.len(),
+            stored_files = stream_info.total_files,
+            "spawning playback metadata enrichment"
+        );
+        let pool = state.pool.clone();
+        let redis = state.redis.clone();
+        let hash = info_hash.to_string();
+        let files = provider_files;
+        let s = season;
+        tokio::spawn(async move {
+            providers::torrents::metadata_update::update_metadata(
+                &pool,
+                Some(&redis),
+                &hash,
+                &files,
+                s,
+            )
+            .await;
+        });
+    } else if !provider_files.is_empty() {
+        tracing::debug!(
+            hash = %info_hash,
+            provider_files = provider_files.len(),
+            stored_files = stream_info.total_files,
+            no_file_metadata,
+            "playback metadata enrichment skipped"
+        );
+    }
+
+    if season.is_some() {
+        let pool = state.pool.clone();
+        let hash = info_hash.to_string();
+        tokio::spawn(async move {
+            providers::torrents::metadata_update::refresh_racing_episode_metadata(
+                &pool, &hash, season,
+            )
+            .await;
+        });
+    }
+
+    Ok(video_url)
+}
+
+async fn get_playback_cache(redis: &fred::clients::Client, key: &str) -> Option<String> {
+    redis
+        .get::<Option<Vec<u8>>, _>(key)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|b| String::from_utf8(b).ok())
+        .filter(|s| !s.is_empty())
+}
+
+async fn set_playback_cache(redis: &fred::clients::Client, key: &str, url: &str) {
+    let _ = redis
+        .set::<(), _, _>(
+            key,
+            url.as_bytes(),
+            Some(Expiration::EX(URL_CACHE_TTL)),
+            None,
+            false,
+        )
+        .await;
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Resolve a PikPak session token: use stored token, or login with email+password.
+///
+/// Legacy tokens (pre-web-client format, missing `device_id`) are cleared from DB/Redis
+/// and replaced with a fresh login when credentials are available.
+async fn pikpak_resolve_token(
+    state: &AppState,
+    provider: &crate::models::user_data::StreamingProvider,
+    credentials: Option<&(String, String)>,
+    profile_id: Option<crate::db::ProfileId>,
+    provider_index: Option<usize>,
+) -> Result<String, providers::ProviderError> {
+    use providers::torrents::pikpak as p;
+
+    let (email, password) = credentials.ok_or_else(|| {
+        providers::ProviderError::api(
+            "PikPak email or password is missing",
+            "invalid_credentials.mp4",
+        )
+    })?;
+
+    let cache_key = format!("pikpak_token:{}", p::token_cache_id(email, password));
+
+    let mut token = provider.token.clone().filter(|t| !t.is_empty());
+
+    if token.is_none() {
+        token = state
+            .redis
+            .get::<Option<Vec<u8>>, _>(&cache_key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|b| String::from_utf8(b).ok())
+            .filter(|t| !t.is_empty());
+    }
+
+    if token.as_ref().is_some_and(|t| p::is_legacy_token(t)) {
+        tracing::info!("PikPak legacy token detected — clearing stored session and re-logging in");
+        pikpak_clear_token(state, email, password, profile_id, provider_index).await;
+        token = None;
+    }
+
+    if let Some(t) = token {
+        return Ok(t);
+    }
+
+    let t = p::login(&state.http, email, password).await?;
+    pikpak_save_token(state, &t, email, password, profile_id, provider_index).await;
+    Ok(t)
+}
+
+/// Remove a stored PikPak token from Redis and the user's DB profile.
+async fn pikpak_clear_token(
+    state: &AppState,
+    email: &str,
+    password: &str,
+    profile_id: Option<crate::db::ProfileId>,
+    provider_index: Option<usize>,
+) {
+    let cache_key = format!(
+        "pikpak_token:{}",
+        providers::torrents::pikpak::token_cache_id(email, password)
+    );
+    let _ = state.redis.del::<(), _>(&cache_key).await;
+
+    if let (Some(pid), Some(idx)) = (profile_id, provider_index) {
+        let pool = state.pool.clone();
+        let redis = state.redis.clone();
+        let key = state.config.secret_key;
+        tokio::spawn(async move {
+            crypto::profile::clear_provider_token(&pool, &redis, &key, pid.0 as i64, idx).await;
+        });
+    }
+}
+
+/// Persist a freshly obtained PikPak login token to both Redis (90-min fallback)
+/// and the user's DB profile (permanent, encrypted in `encrypted_secrets`).
+///
+/// Called after any successful PikPak login — initial login and re-login on token expiry.
+/// The DB write runs as a background task so it never delays the playback response.
+async fn pikpak_save_token(
+    state: &AppState,
+    token: &str,
+    email: &str,
+    password: &str,
+    profile_id: Option<crate::db::ProfileId>,
+    provider_index: Option<usize>,
+) {
+    // Short-term Redis cache: covers D- inline profiles and the window before DB write lands.
+    let cache_key = format!(
+        "pikpak_token:{}",
+        providers::torrents::pikpak::token_cache_id(email, password)
+    );
+    let _ = state
+        .redis
+        .set::<(), _, _>(
+            &cache_key,
+            token.as_bytes(),
+            Some(Expiration::EX(5400)), // 90 min
+            None,
+            false,
+        )
+        .await;
+
+    // Persistent DB write for U- profiles (runs in background).
+    if let (Some(pid), Some(idx)) = (profile_id, provider_index) {
+        let pool = state.pool.clone();
+        let redis = state.redis.clone();
+        let key = state.config.secret_key;
+        let token_owned = token.to_string();
+        tokio::spawn(async move {
+            crypto::profile::patch_provider_token(
+                &pool,
+                &redis,
+                &key,
+                pid.0 as i64,
+                idx,
+                &token_owned,
+            )
+            .await;
+        });
+    }
+}
+
+fn playback_cache_key(
+    secret_str: &str,
+    provider_name: &str,
+    info_hash: &str,
+    season: Option<i32>,
+    episode: Option<i32>,
+    filename: Option<&str>,
+) -> String {
+    let raw =
+        format!("{secret_str}_{provider_name}_{info_hash}_{season:?}_{episode:?}_{filename:?}");
+    let mut hasher = Sha256::new();
+    hasher.update(raw.as_bytes());
+    let hash = hex_encode(&hasher.finalize());
+    format!("playback_url:{hash}")
+}
+
+async fn try_cached_playback_url(
+    state: &AppState,
+    cache_key: &str,
+    info_hash: &str,
+    season: Option<i32>,
+    episode: Option<i32>,
+) -> Option<String> {
+    let cached = get_playback_cache(&state.redis, cache_key).await?;
+    if playback_metadata_needs_refresh(&state.pool_ro, info_hash, season, episode).await {
+        tracing::info!(
+            hash = %info_hash,
+            season = ?season,
+            episode = ?episode,
+            "playback cache bypassed — file metadata still looks like a scraper stub"
+        );
+        let _ = state.redis.del::<(), _>(cache_key).await;
+        return None;
+    }
+    Some(cached)
+}
+
+/// True when the DB still has scraper-guessed file metadata that must be
+/// replaced by a debrid provider's real file list before a cached playback
+/// URL can be trusted (e.g. a single "Race" stub with no real filename).
+async fn playback_metadata_needs_refresh(
+    pool: &sqlx::PgPool,
+    info_hash: &str,
+    season: Option<i32>,
+    episode: Option<i32>,
+) -> bool {
+    let Some(info) = db::fetch_stream_playback_info(pool, info_hash, season, episode).await else {
+        return false;
+    };
+
+    if info.file_index.is_some_and(|index| index < 0)
+        || info.filename.as_deref().is_none_or(str::is_empty)
+    {
+        return true;
+    }
+
+    // Series episode requests against a single mapped row whose filename is
+    // not a real on-disk video name (no extension — e.g. "Race", "Qualifying")
+    // are almost always scraper stubs for one session of a multi-file torrent.
+    if season.is_some() && episode.is_some() {
+        if info.total_files <= 1
+            && info
+                .filename
+                .as_ref()
+                .is_some_and(|name| !is_video_file(name))
+        {
+            return true;
+        }
+        // Episode not mapped for this stream while other files exist — force a
+        // fresh provider resolve so we can enrich metadata.
+        if info.has_no_files && info.total_files > 0 {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn build_magnet_link(info_hash: &str, announce_list: &[String]) -> String {
+    let trackers = announce_list
+        .iter()
+        .map(|t| format!("tr={}", urlencoding::encode(t)))
+        .collect::<Vec<_>>()
+        .join("&");
+    if trackers.is_empty() {
+        format!("magnet:?xt=urn:btih:{info_hash}")
+    } else {
+        format!("magnet:?xt=urn:btih:{info_hash}&{trackers}")
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn error_video_url(state: &AppState, video_file: &str) -> String {
+    format!("{}/static/exceptions/{video_file}", state.config.host_url)
+}
+
+/// 302 redirect for playback. HEAD uses the same resolve path as GET but returns
+/// headers only (no body), matching Stremio/Kodi probe behavior.
+pub(crate) fn playback_redirect(method: Method, url: String) -> Response {
+    let mut builder = Response::builder()
+        .status(StatusCode::FOUND)
+        .header(header::LOCATION, &url)
+        .header(
+            header::CACHE_CONTROL,
+            "no-store, no-cache, must-revalidate, max-age=0",
+        )
+        .header(header::PRAGMA, "no-cache")
+        .header(header::EXPIRES, "0");
+
+    if method == Method::HEAD {
+        builder = builder.header(header::CONTENT_LENGTH, 0);
+    }
+
+    builder
+        .body(Body::empty())
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::playback_cache_key;
+
+    #[tokio::test(start_paused = true)]
+    async fn qbittorrent_route_budget_allows_downloads_past_ninety_seconds() {
+        use serde_json::json;
+        use std::time::Duration;
+        let provider =
+            serde_json::from_value(json!({"sv":"qbittorrent","qbc":{"dwt":1800}})).unwrap();
+        let budget = super::provider_resolve_budget(&provider);
+        assert!(budget.holder >= Duration::from_secs(1800));
+        assert!(budget.client_wait() > budget.holder);
+        assert!(
+            tokio::time::timeout(budget.holder, tokio::time::sleep(Duration::from_secs(1800)))
+                .await
+                .is_ok()
+        );
+        let debrid = serde_json::from_value(json!({"sv":"realdebrid"})).unwrap();
+        assert_eq!(
+            super::provider_resolve_budget(&debrid).holder,
+            Duration::from_secs(90)
+        );
+    }
+
+    #[test]
+    fn playback_cache_key_varies_by_provider() {
+        let base = playback_cache_key("U-abc", "realdebrid", "deadbeef", None, None, None);
+        let torbox = playback_cache_key("U-abc", "torbox", "deadbeef", None, None, None);
+        assert_ne!(base, torbox);
+    }
+
+    #[test]
+    fn playback_cache_key_varies_by_filename() {
+        let no_name = playback_cache_key("U-abc", "torbox", "deadbeef", None, None, None);
+        let named =
+            playback_cache_key("U-abc", "torbox", "deadbeef", None, None, Some("movie.mkv"));
+        assert_ne!(no_name, named);
+    }
+}

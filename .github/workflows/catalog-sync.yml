@@ -1,0 +1,30 @@
+name: Sync Tamil Catalogs & Posters
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # Runs every 6 hours automatically
+  workflow_dispatch:        # Allows manual one-click trigger anytime from GitHub UI
+
+jobs:
+  sync:
+    name: Sync Metadata Feeds
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install --no-cache-dir psycopg2-binary
+
+      - name: Run Catalog & Poster Synchronizer
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python scripts/sync_tamil_catalogs.py

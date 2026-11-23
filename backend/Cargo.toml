@@ -1,0 +1,199 @@
+[package]
+name = "mediafusion-api"
+version = "6.2.0"
+edition = "2024"
+
+[features]
+default = ["jemalloc", "tls-rustls"]
+jemalloc = ["dep:tikv-jemallocator"]
+# TLS backends — pick exactly one. Default is tls-rustls (pure-Rust, musl-safe).
+# tls-native uses the OS TLS stack (SecureTransport on macOS, OpenSSL on Linux).
+# vendored-openssl compiles OpenSSL from source (needed for musl/cross-compile
+# targets where system OpenSSL is unavailable; works with cargo-zigbuild).
+tls-rustls        = ["reqwest/rustls", "lettre/tokio1-rustls-tls"]
+tls-native        = ["reqwest/native-tls", "lettre/tokio1-native-tls"]
+vendored-openssl  = ["openssl/vendored"]
+# NSFW poster classifier — worker-only feature (the API server only enqueues the job).
+# Requires ONNX Runtime prebuilt binaries.
+# Prebuilts: aarch64-apple-darwin, x86_64/aarch64-unknown-linux-gnu (glibc ≥ 2.39),
+#            x86_64/aarch64-pc-windows-msvc (Windows 11 + VS 2022 ≥ 17.14).
+# No prebuilt: musl, x86_64-apple-darwin, windows-gnu.
+nsfw-classifier   = ["dep:ort", "dep:ndarray"]
+# Embed the compiled React SPA into the server binary at build time.
+# Requires clients/frontend/dist/ to exist (run `pnpm build` first).
+# When disabled, falls back to serving from the filesystem (FRONTEND_DIST_DIR).
+embed-frontend    = ["dep:rust-embed", "dep:mime_guess"]
+
+[lib]
+name = "mediafusion_api"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mediafusion-api"
+path = "src/main.rs"
+
+[[bin]]
+name = "mediafusion-worker"
+path = "src/bin/worker.rs"
+
+[[bin]]
+name = "telegram_session"
+path = "src/bin/telegram_session.rs"
+
+[[bin]]
+name = "mediafusion-nsfw-setup"
+path = "src/bin/nsfw_setup.rs"
+required-features = ["nsfw-classifier"]
+
+[[bin]]
+name = "nsfw-bench"
+path = "src/bin/nsfw_bench.rs"
+required-features = ["nsfw-classifier"]
+
+[dependencies]
+# Async trait support
+async-trait = "0.1"
+async-stream = "0.3"
+
+# Async runtime + HTTP server
+axum = { version = "0.8", features = ["macros", "multipart"] }
+lava_torrent = "0.11"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+tower = "0.5"
+tower-http = { version = "0.7", features = ["trace", "compression-full", "timeout", "cors", "fs", "catch-panic"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# XML parsing (Torznab / Newznab scrapers)
+quick-xml = { version = "0.41", features = ["serde"] }
+
+# HTTP client (live scrapers)
+reqwest = { version = "0.13", default-features = false, features = ["gzip", "brotli", "http2", "json", "multipart", "form", "query", "stream"] }
+openssl = { version = "0.10", optional = true }
+
+# Database
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "json", "chrono", "migrate", "macros"] }
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Redis
+fred = { version = "10", features = ["tokio-rustls", "i-hyperloglog", "i-scripts"] }
+
+# AES-256-CBC decryption (matches Python PyCryptodome AES.MODE_CBC)
+aes = "0.9"
+cbc = { version = "0.2", features = ["alloc"] }
+base64 = "0.22"
+
+# Hashing (manifest cache key HMAC-SHA256)
+hmac = { version = "0.13", features = [] }
+sha2 = "0.11"
+
+# Compression
+flate2 = "1"
+tempfile = "3"
+
+# Random bytes for AES IV generation + sports poster selection
+rand_core = "0.10"
+rand = { version = "0.10", features = ["std", "thread_rng"] }
+
+# Poster annotation
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+imageproc = "0.27"
+# cosmic-text: full Unicode text shaping (HarfBuzz via rustybuzz), BiDi, font fallback
+cosmic-text = "0.19"
+
+# In-process LRU cache (imdb_id → media_id)
+moka = { version = "0.12", features = ["future", "sync"] }
+# Force patched transitive dependency (RUSTSEC-2026-0204)
+crossbeam-epoch = "0.9.20"
+
+# Typed errors
+thiserror = "2"
+
+# Scraper rate-limiting
+governor = "0.10"
+
+# Scraper retries
+backon = "1"
+
+# Cron expression parsing for the Rust scheduler
+cron = "0.17"
+
+# Background job cancellation tokens
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# lz-string decompression (DMM hashlist scraper)
+lz-str = "0.2"
+
+# Fuzzy string matching (DLHD / TV poster matching)
+strsim = "0.11"
+
+# NSFW poster classification: ONNX Runtime + tensor arrays (optional — see nsfw-classifier feature)
+ort = { version = "2.0.0-rc.12", features = ["download-binaries", "ndarray"], optional = true }
+ndarray = { version = "0.17", optional = true }
+
+# Frontend embedding: compile React SPA dist/ into the server binary (optional — see embed-frontend feature)
+rust-embed = { version = "8", optional = true }
+mime_guess = { version = "2", default-features = false, optional = true }
+
+# Config from env
+dotenvy = "0.15"
+urlencoding = "2"
+# RFC 3986 userinfo encoding for credentials embedded in WebDAV URLs
+percent-encoding = "2"
+url = "2"
+
+# UUID generation for user registration
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Prometheus metrics
+prometheus-client = "0.25"
+
+# Email (SMTP) for auth flows
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder"] }
+
+# Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Magnet → torrent metadata resolution (BEP-9 / BEP-10)
+mainline = "7"
+sha1 = "0.11"
+md5 = "0.8"
+regex = "1.12.3"
+fancy-regex = "0.18"
+csv = "1"
+scraper = "0.27"
+once_cell = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-credential-types = "1"
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client", "http-1x"] }
+
+# Telegram MTProto live scraper (Phase 2c)
+grammers-client = { version = "0.10", default-features = false }
+grammers-session = { version = "0.10", default-features = false, features = ["serde"] }
+grammers-tl-types = { version = "0.10", features = ["tl-mtproto"] }
+
+# See tikv-jemallocator docs: cfg(not(target_env = "msvc")). Optional so CI can
+# disable it for Windows GNU cross-compiles where jemalloc does not link.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.7", optional = true }
+
+[dev-dependencies]
+wiremock = "0.6"
+insta = { version = "1", features = ["json"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[[bench]]
+name = "stream_warm"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,66 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE jobs\n               SET status    = 'running',\n                   started_at = now(),\n                   worker_id  = $1,\n                   attempts   = attempts + 1\n             WHERE id IN (\n                   SELECT id FROM jobs\n                    WHERE queue      = $2\n                      AND status     = 'pending'\n                      AND NOT cancel_requested\n                      AND scheduled_at <= now()\n                    ORDER BY priority, scheduled_at\n                    FOR UPDATE SKIP LOCKED\n                    LIMIT $3\n                   )\n            RETURNING id, payload, attempts, cancel_requested\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "jobs",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "payload",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "jobs",
+            "name": "payload"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "attempts",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "jobs",
+            "name": "attempts"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "cancel_requested",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "jobs",
+            "name": "cancel_requested"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "108a223ddb74f298ca61574d3811574f9895259f8706230b2ddc3edd2ffc13ab"
+}

@@ -1,0 +1,724 @@
+import { EpisodeImportDropTarget } from './EpisodeImportDropTarget'
+import { useState, useMemo } from 'react'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
+import { ScrollArea, ScrollBar } from '@/components/ui/scroll-area'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from '@/components/ui/alert-dialog'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
+import { Play, Calendar, Tv, Check, Trash2, Loader2, Edit, CheckSquare, Square, Upload } from 'lucide-react'
+import { cn } from '@/lib/utils'
+import { EpisodeEditSheet, type EpisodeData } from './EpisodeEditSheet'
+import { useAuth } from '@/contexts/AuthContext'
+
+export interface EpisodeInfo {
+  id?: number // Episode database ID (for moderator actions)
+  episode_number: number
+  title?: string
+  released?: string
+  overview?: string
+  thumbnail?: string // Episode still/thumbnail image
+  is_user_created?: boolean
+  is_user_addition?: boolean
+  stream_count?: number // Number of streams for this episode (for showing empty episodes)
+  runtime_minutes?: number // Episode runtime in minutes
+}
+
+export interface SeasonInfo {
+  season_number: number
+  episodes: EpisodeInfo[]
+  name?: string
+  overview?: string
+  poster?: string
+}
+
+interface SeriesEpisodePickerProps {
+  seasons: SeasonInfo[]
+  selectedSeason?: number
+  selectedEpisode?: number
+  onSeasonChange: (season: number) => void
+  onEpisodeChange: (episode: number) => void
+  onEpisodeImport?: (files: File[], season: number, episode: number) => void
+  isImportBusy?: boolean
+  onEpisodePlay?: (season: number, episode: number) => void
+  // Admin props (episode deletion is admin-only)
+  isAdmin?: boolean
+  onDeleteEpisode?: (episodeId: number, seasonNumber: number, episodeNumber: number) => Promise<void>
+  isDeletingEpisode?: boolean
+  onDeleteSeason?: (seasonNumber: number) => Promise<void>
+  isDeletingSeason?: boolean
+  onBulkDeleteSeasons?: (seasonNumbers: number[]) => Promise<void>
+  onBulkDeleteEpisodes?: (episodeIds: number[]) => Promise<void>
+  isBulkDeleting?: boolean
+  onEpisodeEditSuccess?: () => void
+  // Series info for episode edit context
+  seriesTitle?: string
+  className?: string
+}
+
+export function SeriesEpisodePicker({
+  seasons,
+  selectedSeason,
+  selectedEpisode,
+  onSeasonChange,
+  onEpisodeChange,
+  onEpisodePlay,
+  onEpisodeImport,
+  isImportBusy = false,
+  isAdmin = false,
+  onDeleteEpisode,
+  isDeletingEpisode = false,
+  onDeleteSeason,
+  isDeletingSeason = false,
+  onBulkDeleteSeasons,
+  onBulkDeleteEpisodes,
+  isBulkDeleting = false,
+  onEpisodeEditSuccess,
+  seriesTitle,
+  className,
+}: SeriesEpisodePickerProps) {
+  const [expandedSeasons, setExpandedSeasons] = useState<number[]>(
+    selectedSeason !== undefined ? [selectedSeason] : seasons.length > 0 ? [seasons[0].season_number] : [],
+  )
+  const [deletingEpisodeId, setDeletingEpisodeId] = useState<number | null>(null)
+  const [deletingSeasonNumber, setDeletingSeasonNumber] = useState<number | null>(null)
+  const [seasonSelectMode, setSeasonSelectMode] = useState(false)
+  const [selectedSeasonNumbers, setSelectedSeasonNumbers] = useState<number[]>([])
+  const { isAuthenticated } = useAuth()
+
+  const currentSeason = useMemo(
+    () => seasons.find((s) => s.season_number === selectedSeason),
+    [seasons, selectedSeason],
+  )
+
+  const episodes = currentSeason?.episodes ?? []
+  const deletableEpisodeIds = episodes.flatMap((episode) => (episode.id ? [episode.id] : []))
+
+  const toggleSeasonSelection = (seasonNumber: number) => {
+    setSelectedSeasonNumbers((prev) =>
+      prev.includes(seasonNumber) ? prev.filter((n) => n !== seasonNumber) : [...prev, seasonNumber],
+    )
+  }
+
+  const handleSeasonTabClick = (seasonNumber: number) => {
+    if (seasonSelectMode) {
+      toggleSeasonSelection(seasonNumber)
+      return
+    }
+    onSeasonChange(seasonNumber)
+    if (!expandedSeasons.includes(seasonNumber)) {
+      setExpandedSeasons((prev) => [...prev, seasonNumber])
+    }
+  }
+
+  const formatDate = (dateStr?: string) => {
+    if (!dateStr) return null
+    try {
+      return new Date(dateStr).toLocaleDateString('en-US', {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+      })
+    } catch {
+      return dateStr
+    }
+  }
+
+  const isAired = (dateStr?: string) => {
+    if (!dateStr) return true // Assume aired if no date
+    try {
+      return new Date(dateStr) <= new Date()
+    } catch {
+      return true
+    }
+  }
+
+  if (seasons.length === 0) {
+    return null
+  }
+
+  return (
+    <Card className={cn('glass border-border/50', className)}>
+      <CardHeader className="pb-3">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Tv className="h-5 w-5 text-primary" />
+            <CardTitle className="text-lg">Episodes</CardTitle>
+          </div>
+          {selectedSeason !== undefined && selectedEpisode !== undefined && (
+            <Badge variant="secondary" className="rounded-lg">
+              S{selectedSeason.toString().padStart(2, '0')}E{selectedEpisode.toString().padStart(2, '0')}
+            </Badge>
+          )}
+        </div>
+        <CardDescription className="flex items-center justify-between gap-3">
+          <span>
+            {seasons.length} season{seasons.length !== 1 ? 's' : ''} available
+          </span>
+          {isAdmin && (onBulkDeleteSeasons || onBulkDeleteEpisodes) && (
+            <div className="flex items-center gap-2">
+              {onBulkDeleteSeasons && (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={seasonSelectMode ? 'secondary' : 'outline'}
+                  className="h-7 rounded-md"
+                  onClick={() => {
+                    setSeasonSelectMode((prev) => !prev)
+                    setSelectedSeasonNumbers([])
+                  }}
+                  disabled={isBulkDeleting}
+                >
+                  {seasonSelectMode ? 'Cancel select' : 'Select seasons'}
+                </Button>
+              )}
+            </div>
+          )}
+        </CardDescription>
+        {isAdmin && seasonSelectMode && onBulkDeleteSeasons && (
+          <div className="flex flex-wrap items-center gap-2 pt-1">
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="h-7 rounded-md"
+              onClick={() => setSelectedSeasonNumbers(seasons.map((s) => s.season_number))}
+              disabled={isBulkDeleting}
+            >
+              Select all
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="h-7 rounded-md"
+              onClick={() => setSelectedSeasonNumbers([])}
+              disabled={isBulkDeleting || selectedSeasonNumbers.length === 0}
+            >
+              Clear
+            </Button>
+            <AlertDialog>
+              <AlertDialogTrigger asChild>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="destructive"
+                  className="h-7 rounded-md"
+                  disabled={isBulkDeleting || selectedSeasonNumbers.length === 0}
+                >
+                  {isBulkDeleting ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin mr-1" />
+                  ) : (
+                    <Trash2 className="h-3.5 w-3.5 mr-1" />
+                  )}
+                  Delete {selectedSeasonNumbers.length} season{selectedSeasonNumbers.length === 1 ? '' : 's'}
+                </Button>
+              </AlertDialogTrigger>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>Delete selected seasons?</AlertDialogTitle>
+                  <AlertDialogDescription>
+                    This will permanently delete {selectedSeasonNumbers.length} season
+                    {selectedSeasonNumbers.length === 1 ? '' : 's'} and all episodes inside them. This action cannot be
+                    undone.
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>Cancel</AlertDialogCancel>
+                  <AlertDialogAction
+                    className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                    onClick={async () => {
+                      await onBulkDeleteSeasons(selectedSeasonNumbers)
+                      setSelectedSeasonNumbers([])
+                      setSeasonSelectMode(false)
+                    }}
+                  >
+                    Delete seasons
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
+          </div>
+        )}
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {/* Horizontal Season Tabs */}
+        <ScrollArea className="w-full pb-2">
+          <div className="flex gap-2">
+            {seasons.map((season) => (
+              <Button
+                key={season.season_number}
+                variant={
+                  seasonSelectMode
+                    ? selectedSeasonNumbers.includes(season.season_number)
+                      ? 'destructive'
+                      : 'outline'
+                    : selectedSeason === season.season_number
+                      ? 'default'
+                      : 'outline'
+                }
+                size="sm"
+                onClick={() => handleSeasonTabClick(season.season_number)}
+                className={cn(
+                  'rounded-full whitespace-nowrap transition-all',
+                  !seasonSelectMode &&
+                    selectedSeason === season.season_number &&
+                    'bg-gradient-to-r from-primary to-primary/80',
+                )}
+              >
+                {seasonSelectMode && (
+                  <span className="mr-1.5 inline-flex">
+                    {selectedSeasonNumbers.includes(season.season_number) ? (
+                      <CheckSquare className="h-3.5 w-3.5" />
+                    ) : (
+                      <Square className="h-3.5 w-3.5" />
+                    )}
+                  </span>
+                )}
+                {season.name || `Season ${season.season_number}`}
+                <Badge
+                  variant="secondary"
+                  className={cn(
+                    'ml-2 h-5 min-w-5 px-1.5 text-[10px] rounded-full',
+                    selectedSeason === season.season_number ? 'bg-white/20 text-white' : 'bg-muted',
+                  )}
+                >
+                  {season.episodes.length}
+                </Badge>
+              </Button>
+            ))}
+          </div>
+          <ScrollBar orientation="horizontal" />
+        </ScrollArea>
+
+        {/* Episode List */}
+        {currentSeason && (
+          <div className="space-y-2">
+            {/* Episode count indicator */}
+            <div className="flex items-center justify-between text-xs text-muted-foreground px-1">
+              <div className="flex items-center gap-2">
+                <span>
+                  {episodes.length} episode{episodes.length !== 1 ? 's' : ''}
+                </span>
+                {episodes.filter((e) => isAired(e.released)).length !== episodes.length && (
+                  <span className="text-primary">{episodes.filter((e) => !isAired(e.released)).length} upcoming</span>
+                )}
+              </div>
+              {isAdmin && onDeleteSeason && selectedSeason !== undefined && !seasonSelectMode && (
+                <AlertDialog>
+                  <AlertDialogTrigger asChild>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-7 px-2 rounded-md text-destructive hover:text-destructive hover:bg-destructive/10"
+                      disabled={isDeletingSeason}
+                    >
+                      {deletingSeasonNumber === selectedSeason ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin mr-1" />
+                      ) : (
+                        <Trash2 className="h-3.5 w-3.5 mr-1" />
+                      )}
+                      Delete Season
+                    </Button>
+                  </AlertDialogTrigger>
+                  <AlertDialogContent>
+                    <AlertDialogHeader>
+                      <AlertDialogTitle>Delete Season?</AlertDialogTitle>
+                      <AlertDialogDescription>
+                        This will permanently delete season {selectedSeason}
+                        {currentSeason.name && ` - "${currentSeason.name}"`}.
+                        <br />
+                        <br />
+                        All episodes in this season will be removed. This action cannot be undone.
+                      </AlertDialogDescription>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter>
+                      <AlertDialogCancel>Cancel</AlertDialogCancel>
+                      <AlertDialogAction
+                        className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                        onClick={async (e) => {
+                          e.stopPropagation()
+                          setDeletingSeasonNumber(selectedSeason)
+                          try {
+                            await onDeleteSeason(selectedSeason)
+                          } finally {
+                            setDeletingSeasonNumber(null)
+                          }
+                        }}
+                      >
+                        Delete Season
+                      </AlertDialogAction>
+                    </AlertDialogFooter>
+                  </AlertDialogContent>
+                </AlertDialog>
+              )}
+              {isAdmin && onBulkDeleteEpisodes && deletableEpisodeIds.length > 0 && !seasonSelectMode && (
+                <AlertDialog>
+                  <AlertDialogTrigger asChild>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-7 px-2 rounded-md text-destructive hover:text-destructive hover:bg-destructive/10"
+                      disabled={isBulkDeleting}
+                    >
+                      {isBulkDeleting ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin mr-1" />
+                      ) : (
+                        <Trash2 className="h-3.5 w-3.5 mr-1" />
+                      )}
+                      Delete all episodes
+                    </Button>
+                  </AlertDialogTrigger>
+                  <AlertDialogContent>
+                    <AlertDialogHeader>
+                      <AlertDialogTitle>Delete all episodes in this season?</AlertDialogTitle>
+                      <AlertDialogDescription>
+                        This will permanently delete all {deletableEpisodeIds.length} episode
+                        {deletableEpisodeIds.length === 1 ? '' : 's'} in season {selectedSeason}. The season itself will
+                        remain unless you delete it separately.
+                      </AlertDialogDescription>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter>
+                      <AlertDialogCancel>Cancel</AlertDialogCancel>
+                      <AlertDialogAction
+                        className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                        onClick={async () => {
+                          await onBulkDeleteEpisodes(deletableEpisodeIds)
+                        }}
+                      >
+                        Delete episodes
+                      </AlertDialogAction>
+                    </AlertDialogFooter>
+                  </AlertDialogContent>
+                </AlertDialog>
+              )}
+            </div>
+
+            {/* Scrollable episode list with max height */}
+            <ScrollArea className="h-[400px] pr-3" containScroll={false}>
+              <div className="grid gap-2">
+                {episodes.map((episode) => {
+                  const isSelected = selectedEpisode === episode.episode_number
+                  const aired = isAired(episode.released)
+
+                  return (
+                    <EpisodeImportDropTarget
+                      key={episode.episode_number}
+                      season={selectedSeason!}
+                      episode={episode.episode_number}
+                      onImport={isAuthenticated ? onEpisodeImport : undefined}
+                      disabled={isImportBusy}
+                    >
+                      {(openFilePicker) => (
+                        <div
+                          className={cn(
+                            'group relative flex gap-3 p-3 rounded-xl transition-all cursor-pointer',
+                            'hover:bg-muted/50',
+                            isSelected && 'bg-primary/10 border border-primary/30',
+                            !aired && 'opacity-60',
+                          )}
+                          onClick={() => aired && onEpisodeChange(episode.episode_number)}
+                        >
+                          {/* Episode Thumbnail or Number */}
+                          {episode.thumbnail ? (
+                            <div className="flex-shrink-0 w-28 h-16 rounded-lg overflow-hidden bg-muted">
+                              <img
+                                src={episode.thumbnail}
+                                alt={episode.title || `Episode ${episode.episode_number}`}
+                                className="w-full h-full object-cover"
+                                loading="lazy"
+                              />
+                              <div
+                                className={cn(
+                                  'absolute top-2 left-2 w-6 h-6 rounded-md flex items-center justify-center text-xs font-bold',
+                                  'bg-black/70 text-white backdrop-blur-sm',
+                                )}
+                              >
+                                {episode.episode_number}
+                              </div>
+                            </div>
+                          ) : (
+                            <div
+                              className={cn(
+                                'flex-shrink-0 w-12 h-12 rounded-lg flex items-center justify-center text-sm font-medium',
+                                isSelected
+                                  ? 'bg-gradient-to-br from-primary to-primary/80 text-white'
+                                  : 'bg-muted text-muted-foreground',
+                              )}
+                            >
+                              {episode.episode_number}
+                            </div>
+                          )}
+
+                          {/* Episode Info */}
+                          <div className="flex-1 min-w-0 flex flex-col justify-center">
+                            <div className="flex items-center gap-2">
+                              <span className={cn('font-medium line-clamp-1', isSelected && 'text-primary')}>
+                                {episode.title || `Episode ${episode.episode_number}`}
+                              </span>
+                              {!aired && (
+                                <Badge
+                                  variant="outline"
+                                  className="text-[10px] px-1.5 py-0 border-primary/50 text-primary flex-shrink-0"
+                                >
+                                  Upcoming
+                                </Badge>
+                              )}
+                            </div>
+                            <div className="flex items-center gap-2 mt-0.5">
+                              {episode.released && (
+                                <span className="flex items-center gap-1 text-xs text-muted-foreground">
+                                  <Calendar className="h-3 w-3" />
+                                  {formatDate(episode.released)}
+                                </span>
+                              )}
+                            </div>
+                            {/* Episode overview preview */}
+                            {episode.overview && (
+                              <p className="text-xs text-muted-foreground line-clamp-2 mt-1">{episode.overview}</p>
+                            )}
+                          </div>
+
+                          {/* Play/Select Button and Actions */}
+                          <div className="flex-shrink-0 flex items-center gap-1">
+                            {isAuthenticated && onEpisodeImport && (
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="h-8 w-8 p-0 rounded-lg text-muted-foreground hover:text-primary"
+                                disabled={isImportBusy}
+                                aria-label={`Import stream for season ${selectedSeason}, episode ${episode.episode_number}`}
+                                title="Import stream or drop a torrent/NZB file onto this episode"
+                                onClick={(event) => {
+                                  event.stopPropagation()
+                                  openFilePicker()
+                                }}
+                              >
+                                <Upload className="h-4 w-4" />
+                              </Button>
+                            )}
+                            {/* User Edit Button */}
+                            {isAuthenticated && episode.id && (
+                              <EpisodeEditSheet
+                                episode={
+                                  {
+                                    id: episode.id,
+                                    episode_number: episode.episode_number,
+                                    title: episode.title,
+                                    overview: episode.overview,
+                                    air_date: episode.released,
+                                    runtime_minutes: episode.runtime_minutes,
+                                    season_number: selectedSeason,
+                                    series_title: seriesTitle,
+                                  } as EpisodeData
+                                }
+                                onSuccess={onEpisodeEditSuccess}
+                                trigger={
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    className={cn(
+                                      'h-8 w-8 p-0 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity',
+                                      'text-muted-foreground hover:text-primary hover:bg-primary/10',
+                                    )}
+                                    onClick={(e) => e.stopPropagation()}
+                                    aria-label="Suggest edit"
+                                    title="Suggest edit"
+                                  >
+                                    <Edit className="h-4 w-4" />
+                                  </Button>
+                                }
+                              />
+                            )}
+
+                            {/* Admin Delete Button */}
+                            {isAdmin && episode.id && onDeleteEpisode && (
+                              <AlertDialog>
+                                <TooltipProvider>
+                                  <Tooltip>
+                                    <AlertDialogTrigger asChild>
+                                      <TooltipTrigger asChild>
+                                        <Button
+                                          size="sm"
+                                          variant="ghost"
+                                          className={cn(
+                                            'h-8 w-8 p-0 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity',
+                                            'text-destructive hover:text-destructive hover:bg-destructive/10',
+                                          )}
+                                          onClick={(e) => e.stopPropagation()}
+                                          disabled={isDeletingEpisode}
+                                        >
+                                          {deletingEpisodeId === episode.id ? (
+                                            <Loader2 className="h-4 w-4 animate-spin" />
+                                          ) : (
+                                            <Trash2 className="h-4 w-4" />
+                                          )}
+                                        </Button>
+                                      </TooltipTrigger>
+                                    </AlertDialogTrigger>
+                                    <TooltipContent>
+                                      <p>Delete episode (admin)</p>
+                                    </TooltipContent>
+                                  </Tooltip>
+                                </TooltipProvider>
+                                <AlertDialogContent onClick={(e) => e.stopPropagation()}>
+                                  <AlertDialogHeader>
+                                    <AlertDialogTitle>Delete Episode?</AlertDialogTitle>
+                                    <AlertDialogDescription>
+                                      This will permanently delete S{selectedSeason?.toString().padStart(2, '0')}E
+                                      {episode.episode_number.toString().padStart(2, '0')}
+                                      {episode.title && ` - "${episode.title}"`} from the database.
+                                      <br />
+                                      <br />
+                                      This action cannot be undone. Use this to clean up incorrectly auto-detected
+                                      episodes.
+                                    </AlertDialogDescription>
+                                  </AlertDialogHeader>
+                                  <AlertDialogFooter>
+                                    <AlertDialogCancel>Cancel</AlertDialogCancel>
+                                    <AlertDialogAction
+                                      className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                                      onClick={async (e) => {
+                                        e.stopPropagation()
+                                        if (episode.id) {
+                                          setDeletingEpisodeId(episode.id)
+                                          try {
+                                            await onDeleteEpisode(episode.id, selectedSeason!, episode.episode_number)
+                                          } finally {
+                                            setDeletingEpisodeId(null)
+                                          }
+                                        }
+                                      }}
+                                    >
+                                      Delete Episode
+                                    </AlertDialogAction>
+                                  </AlertDialogFooter>
+                                </AlertDialogContent>
+                              </AlertDialog>
+                            )}
+
+                            {aired && onEpisodePlay ? (
+                              <Button
+                                size="sm"
+                                variant={isSelected ? 'default' : 'ghost'}
+                                className={cn(
+                                  'h-9 w-9 p-0 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity',
+                                  isSelected && 'opacity-100 bg-gradient-to-r from-primary to-primary/80',
+                                )}
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  onEpisodePlay(selectedSeason!, episode.episode_number)
+                                }}
+                              >
+                                <Play className="h-4 w-4" />
+                              </Button>
+                            ) : isSelected ? (
+                              <Check className="h-4 w-4 text-primary" />
+                            ) : null}
+                          </div>
+                        </div>
+                      )}
+                    </EpisodeImportDropTarget>
+                  )
+                })}
+              </div>
+            </ScrollArea>
+
+            {episodes.length === 0 && (
+              <div className="text-center py-8 text-muted-foreground">
+                <Tv className="h-12 w-12 mx-auto opacity-50 mb-2" />
+                <p>No episodes available for this season</p>
+              </div>
+            )}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+// Compact version for inline use
+export function SeasonEpisodeSelector({
+  seasons,
+  selectedSeason,
+  selectedEpisode,
+  onSeasonChange,
+  onEpisodeChange,
+  className,
+}: Omit<SeriesEpisodePickerProps, 'onEpisodePlay'>) {
+  const currentSeason = useMemo(
+    () => seasons.find((s) => s.season_number === selectedSeason),
+    [seasons, selectedSeason],
+  )
+
+  return (
+    <div className={cn('flex flex-wrap gap-3', className)}>
+      {/* Season Pills */}
+      <div className="space-y-1.5">
+        <label className="text-xs font-medium text-muted-foreground">Season</label>
+        <ScrollArea className="w-auto max-w-[300px]">
+          <div className="flex gap-1.5 pb-1">
+            {seasons.map((season) => (
+              <Button
+                key={season.season_number}
+                variant={selectedSeason === season.season_number ? 'default' : 'outline'}
+                size="sm"
+                onClick={() => {
+                  onSeasonChange(season.season_number)
+                  // Auto-select first episode when changing seasons
+                  if (season.episodes.length > 0) {
+                    onEpisodeChange(season.episodes[0].episode_number)
+                  }
+                }}
+                className={cn(
+                  'h-8 px-3 rounded-lg',
+                  selectedSeason === season.season_number && 'bg-gradient-to-r from-primary to-primary/80',
+                )}
+              >
+                {season.season_number}
+              </Button>
+            ))}
+          </div>
+          <ScrollBar orientation="horizontal" />
+        </ScrollArea>
+      </div>
+
+      {/* Episode Pills */}
+      {currentSeason && currentSeason.episodes.length > 0 && (
+        <div className="space-y-1.5">
+          <label className="text-xs font-medium text-muted-foreground">Episode</label>
+          <ScrollArea className="w-auto max-w-[400px]">
+            <div className="flex gap-1.5 pb-1">
+              {currentSeason.episodes.map((episode) => (
+                <Button
+                  key={episode.episode_number}
+                  variant={selectedEpisode === episode.episode_number ? 'default' : 'outline'}
+                  size="sm"
+                  onClick={() => onEpisodeChange(episode.episode_number)}
+                  className={cn(
+                    'h-8 min-w-8 px-3 rounded-lg',
+                    selectedEpisode === episode.episode_number && 'bg-gradient-to-r from-primary to-primary/80',
+                  )}
+                  title={episode.title || `Episode ${episode.episode_number}`}
+                >
+                  {episode.episode_number}
+                </Button>
+              ))}
+            </div>
+            <ScrollBar orientation="horizontal" />
+          </ScrollArea>
+        </div>
+      )}
+    </div>
+  )
+}

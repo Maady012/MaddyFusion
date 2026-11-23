@@ -1,0 +1,421 @@
+import { useState } from 'react'
+import { Link, useSearchParams, useLocation } from 'react-router-dom'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { Input } from '@/components/ui/input'
+import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
+import { Card, CardContent } from '@/components/ui/card'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Skeleton } from '@/components/ui/skeleton'
+import { ListPagination } from '@/components/ui/list-pagination'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from '@/components/ui/alert-dialog'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
+import { Ban, Search, CheckCircle, Loader2, ShieldAlert, Calendar, User, Tag, EyeOff } from 'lucide-react'
+import { adminApi, type BlockedMediaItem } from '@/lib/api/admin'
+import { useToast } from '@/hooks/use-toast'
+import { useRole } from '@/hooks/useRole'
+import { Poster } from '@/components/ui/poster'
+import { useRpdb } from '@/contexts/RpdbContext'
+import { saveContentDetailReturnUrl } from '../browseNavigation'
+
+const PAGE_SIZE_OPTIONS = [25, 50, 100] as const
+type PageSize = (typeof PAGE_SIZE_OPTIONS)[number]
+
+function parsePageSize(raw: string | null): PageSize {
+  const n = parseInt(raw ?? '25', 10)
+  return PAGE_SIZE_OPTIONS.includes(n as PageSize) ? (n as PageSize) : 25
+}
+
+const TYPE_LABELS = {
+  movie: 'Movie',
+  series: 'Series',
+  tv: 'TV',
+}
+
+const FILTER_LABELS: Record<string, string> = {
+  all_restricted: 'All Restricted',
+  manual: 'Manually Blocked',
+  keyword_blocked: 'Keyword Blocked',
+  keyword_blocked_only: 'Keyword Blocked Only',
+  nsfw_flagged: 'NSFW Flagged',
+}
+
+function BlockedItemCard({
+  item,
+  onUnblocked,
+  returnLabel,
+}: {
+  item: BlockedMediaItem
+  onUnblocked: () => void
+  returnLabel: string
+}) {
+  const { toast } = useToast()
+  const { rpdbApiKey } = useRpdb()
+  const location = useLocation()
+  const isKeywordOnly = item.is_keyword_blocked && !item.is_blocked
+
+  const unblockMutation = useMutation({
+    mutationFn: () => adminApi.unblockMedia(item.id),
+    onSuccess: (data) => {
+      toast({ title: 'Content unblocked', description: data.message })
+      onUnblocked()
+    },
+    onError: (error: Error) => {
+      toast({ variant: 'destructive', title: 'Unblock failed', description: error.message })
+    },
+  })
+
+  const contentPath = `/dashboard/content/${item.type}/${item.id}`
+
+  const handleContentClick = () => {
+    saveContentDetailReturnUrl(location.pathname, location.search, returnLabel)
+  }
+
+  return (
+    <div className="group relative">
+      <Card className="overflow-hidden border-border/50 bg-card/50 hover:border-destructive/50 transition-colors">
+        {/* Poster */}
+        <div className="relative aspect-[2/3] overflow-hidden">
+          <Poster
+            metaId={item.imdb_id ?? `mf:${item.id}`}
+            catalogType={item.type}
+            poster={item.poster}
+            rpdbApiKey={item.type !== 'tv' ? rpdbApiKey : null}
+            title={item.title}
+            className="opacity-60 group-hover:opacity-70 transition-opacity w-full h-full rounded-none"
+          />
+
+          {/* Restriction badges */}
+          <div className="absolute top-2 left-2 flex flex-col gap-1">
+            {item.is_blocked && (
+              <Badge variant="destructive" className="text-xs gap-1">
+                <Ban className="h-3 w-3" />
+                Blocked
+              </Badge>
+            )}
+            {item.is_keyword_blocked && (
+              <Badge className="text-xs gap-1 bg-orange-600 text-white border-orange-600">
+                <Tag className="h-3 w-3" />
+                Keyword
+              </Badge>
+            )}
+            {item.nsfw_flagged && (
+              <Badge className="text-xs gap-1 bg-purple-600 text-white border-purple-600">
+                <EyeOff className="h-3 w-3" />
+                NSFW
+              </Badge>
+            )}
+          </div>
+
+          {/* Type badge */}
+          <div className="absolute top-2 right-2">
+            <Badge variant="secondary" className="text-xs">
+              {TYPE_LABELS[item.type]}
+            </Badge>
+          </div>
+        </div>
+
+        <CardContent className="p-3 space-y-2">
+          {/* Title */}
+          <Link
+            to={contentPath}
+            onClick={handleContentClick}
+            className="block text-sm font-medium leading-tight hover:text-primary transition-colors line-clamp-2"
+            title={item.title}
+          >
+            {item.title}
+            {item.year && <span className="text-muted-foreground font-normal ml-1">({item.year})</span>}
+          </Link>
+
+          {/* Block reason */}
+          {item.block_reason && (
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <p className="text-xs text-destructive/80 line-clamp-1 cursor-default">{item.block_reason}</p>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" className="max-w-xs">
+                  <p className="text-xs">{item.block_reason}</p>
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          )}
+
+          {/* Meta: blocker + date */}
+          <div className="flex flex-col gap-1">
+            {item.blocked_by && (
+              <div className="flex items-center gap-1 text-xs text-muted-foreground">
+                <User className="h-3 w-3 shrink-0" />
+                <span className="truncate">{item.blocked_by}</span>
+              </div>
+            )}
+            {item.blocked_at && (
+              <div className="flex items-center gap-1 text-xs text-muted-foreground">
+                <Calendar className="h-3 w-3 shrink-0" />
+                <span>{new Date(item.blocked_at).toLocaleDateString()}</span>
+              </div>
+            )}
+          </div>
+
+          {/* Unblock button */}
+          {isKeywordOnly || item.nsfw_flagged ? (
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="w-full">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="w-full h-7 text-xs gap-1 opacity-50 cursor-not-allowed"
+                      disabled
+                    >
+                      <ShieldAlert className="h-3 w-3" />
+                      {item.nsfw_flagged ? 'NSFW flagged' : 'Keyword blocked'}
+                    </Button>
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" className="max-w-xs">
+                  <p className="text-xs">
+                    {item.nsfw_flagged
+                      ? 'Flagged by NSFW classifier. Review in the NSFW tab.'
+                      : 'Blocked by keyword filter. Edit the keyword list to unblock.'}
+                  </p>
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          ) : (
+            <AlertDialog>
+              <AlertDialogTrigger asChild>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="w-full h-7 text-xs gap-1 border-emerald-500/30 text-emerald-500 hover:bg-emerald-500/10 hover:text-emerald-400"
+                  disabled={unblockMutation.isPending}
+                >
+                  {unblockMutation.isPending ? (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  ) : (
+                    <CheckCircle className="h-3 w-3" />
+                  )}
+                  Unblock
+                </Button>
+              </AlertDialogTrigger>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>Unblock "{item.title}"?</AlertDialogTitle>
+                  <AlertDialogDescription>
+                    This will make the content visible to all users again.
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>Cancel</AlertDialogCancel>
+                  <AlertDialogAction onClick={() => unblockMutation.mutate()}>Unblock</AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+
+export function BlockedLibraryTab() {
+  const [searchParams, setSearchParams] = useSearchParams()
+  const queryClient = useQueryClient()
+  const { isAdmin } = useRole()
+
+  const catalogType = (searchParams.get('type') as 'movie' | 'series' | 'tv') || ''
+  const filter = isAdmin ? searchParams.get('b_filter') || 'all_restricted' : 'keyword_blocked_only'
+  const page = Math.max(1, parseInt(searchParams.get('b_page') || '1', 10) || 1)
+  const pageSize = parsePageSize(searchParams.get('b_page_size'))
+  const [search, setSearch] = useState('')
+
+  const setType = (value: string) => {
+    const next = new URLSearchParams(searchParams)
+    if (value && value !== 'all') {
+      next.set('type', value)
+    } else {
+      next.delete('type')
+    }
+    next.set('b_page', '1')
+    setSearchParams(next, { replace: true })
+  }
+
+  const setFilter = (value: string) => {
+    const next = new URLSearchParams(searchParams)
+    next.set('b_filter', value)
+    next.set('b_page', '1')
+    setSearchParams(next, { replace: true })
+  }
+
+  const setPage = (value: number) => {
+    const next = new URLSearchParams(searchParams)
+    if (value > 1) {
+      next.set('b_page', String(value))
+    } else {
+      next.delete('b_page')
+    }
+    setSearchParams(next, { replace: true })
+  }
+
+  const setPageSize = (value: PageSize) => {
+    const next = new URLSearchParams(searchParams)
+    next.set('b_page_size', String(value))
+    next.set('b_page', '1')
+    setSearchParams(next, { replace: true })
+  }
+
+  const queryKey = ['admin', 'blocked-media', { type: catalogType || undefined, search, page, pageSize, filter }]
+
+  const { data, isLoading } = useQuery({
+    queryKey,
+    queryFn: () =>
+      adminApi.getBlockedMedia({
+        type: catalogType || undefined,
+        search: search || undefined,
+        page,
+        page_size: pageSize,
+        filter,
+      }),
+  })
+
+  const handleUnblocked = () => {
+    queryClient.invalidateQueries({ queryKey: ['admin', 'blocked-media'] })
+  }
+
+  const returnLabel = FILTER_LABELS[filter] ?? 'Blocked Content'
+  const totalPages = data ? Math.max(1, Math.ceil(data.total / pageSize)) : 1
+
+  const handlePageChange = (nextPage: number) => {
+    setPage(nextPage)
+    window.scrollTo(0, 0)
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* Header */}
+      <div className="flex items-center gap-3 p-4 rounded-xl bg-destructive/5 border border-destructive/20">
+        <ShieldAlert className="h-5 w-5 text-destructive shrink-0" />
+        <div>
+          <p className="text-sm font-medium text-destructive">Restricted Content</p>
+          <p className="text-xs text-muted-foreground">
+            {data
+              ? `${data.total} item${data.total !== 1 ? 's' : ''} restricted`
+              : isAdmin
+                ? 'Admin view — restricted items are hidden from regular users'
+                : 'Keyword-blocked items are hidden from regular users'}
+          </p>
+        </div>
+      </div>
+
+      {/* Filters */}
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative flex-1 min-w-[200px]">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+          <Input
+            placeholder="Search restricted items..."
+            value={search}
+            onChange={(e) => {
+              setSearch(e.target.value)
+              setPage(1)
+            }}
+            className="pl-9 rounded-xl"
+          />
+        </div>
+
+        {isAdmin && (
+          <Select value={filter} onValueChange={setFilter}>
+            <SelectTrigger className="w-[175px] rounded-xl">
+              <SelectValue placeholder="All Restricted" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all_restricted">All Restricted</SelectItem>
+              <SelectItem value="manual">Manually Blocked</SelectItem>
+              <SelectItem value="keyword_blocked">Keyword Blocked</SelectItem>
+              <SelectItem value="keyword_blocked_only">Keyword Blocked Only</SelectItem>
+              <SelectItem value="nsfw_flagged">NSFW Flagged</SelectItem>
+            </SelectContent>
+          </Select>
+        )}
+
+        <Select value={catalogType || 'all'} onValueChange={setType}>
+          <SelectTrigger className="w-[140px] rounded-xl">
+            <SelectValue placeholder="All Types" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All Types</SelectItem>
+            <SelectItem value="movie">Movies</SelectItem>
+            <SelectItem value="series">Series</SelectItem>
+            <SelectItem value="tv">TV</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+
+      {data && data.total > 0 && (
+        <ListPagination
+          inputId="blocked-page-jump"
+          currentPage={page}
+          totalPages={totalPages}
+          totalItems={data.total}
+          pageSize={pageSize}
+          onPageChange={handlePageChange}
+          pageSizeOptions={PAGE_SIZE_OPTIONS}
+          onPageSizeChange={(size) => setPageSize(size as PageSize)}
+          alwaysShowSummary
+        />
+      )}
+
+      {/* Grid */}
+      {isLoading ? (
+        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-4">
+          {[...Array(12)].map((_, i) => (
+            <div key={i} className="space-y-2">
+              <Skeleton className="aspect-[2/3] rounded-xl" />
+              <Skeleton className="h-4 w-3/4" />
+            </div>
+          ))}
+        </div>
+      ) : !data?.items.length ? (
+        <div className="text-center py-16">
+          <CheckCircle className="h-16 w-16 mx-auto text-emerald-500/40" />
+          <p className="mt-4 text-muted-foreground font-medium">No restricted content</p>
+          <p className="text-sm text-muted-foreground mt-1">
+            {search || catalogType ? 'No results match your filters.' : 'All clear — nothing is currently restricted.'}
+          </p>
+        </div>
+      ) : (
+        <>
+          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-4">
+            {data.items.map((item) => (
+              <BlockedItemCard key={item.id} item={item} onUnblocked={handleUnblocked} returnLabel={returnLabel} />
+            ))}
+          </div>
+
+          {data.total > pageSize && (
+            <ListPagination
+              inputId="blocked-page-jump-bottom"
+              currentPage={page}
+              totalPages={totalPages}
+              totalItems={data.total}
+              pageSize={pageSize}
+              onPageChange={handlePageChange}
+              pageSizeOptions={PAGE_SIZE_OPTIONS}
+              onPageSizeChange={(size) => setPageSize(size as PageSize)}
+            />
+          )}
+        </>
+      )}
+    </div>
+  )
+}

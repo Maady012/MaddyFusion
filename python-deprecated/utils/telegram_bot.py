@@ -1,0 +1,6573 @@
+import asyncio
+import hashlib
+import json
+import logging
+import os
+import random
+import re
+import secrets
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+from time import monotonic
+from typing import Any
+from urllib.parse import unquote, urlparse
+
+import aiohttp
+import PTT
+import pytz
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
+from sqlmodel import func, select
+
+from db import crud
+from db.config import settings
+from db.crud.reference import get_or_create_catalog, get_or_create_genre, get_or_create_language
+from db.crud.streams import (
+    add_languages_to_stream,
+    create_acestream_stream,
+    create_http_stream,
+    create_torrent_stream,
+    create_usenet_stream,
+    create_youtube_stream,
+)
+from db.database import get_async_session_context
+from db.enums import ContributionStatus, MediaType, UserRole
+from db.models import Contribution, EpisodeSuggestion, MetadataSuggestion, StreamSuggestion, User
+from db.models.links import MediaCatalogLink, MediaGenreLink
+from db.models.media import Media
+from db.models.streams import (
+    AceStreamStream,
+    HTTPStream,
+    Stream,
+    TelegramStream,
+    TorrentStream,
+    UsenetStream,
+    YouTubeStream,
+)
+from db.models.providers import MediaImage, MetadataProvider
+from reference.routers.content.anonymous_utils import normalize_anonymous_display_name, resolve_uploader_identity
+from utils.sports_parser import (
+    SPORTS_CATEGORIES,
+    detect_sports_category,
+    parse_sports_title,
+)
+from utils.runtime_const import SPORTS_ARTIFACTS
+from db.redis_database import REDIS_ASYNC_CLIENT, REDIS_SYNC_CLIENT
+from reference.routers.content.torrent_import import fetch_and_create_media_from_external
+from workers.scrapers.imdb_data import get_imdb_title_data, search_multiple_imdb
+from workers.scrapers.non_torrent_background_scraper import _normalize_telegram_channel_identifier
+from workers.scrapers.scraper_tasks import meta_fetcher
+from utils.notification_registry import (
+    register_file_annotation_handler,
+    register_pending_contribution_handler,
+    register_pending_episode_suggestion_handler,
+    register_pending_metadata_suggestion_handler,
+    register_pending_stream_suggestion_handler,
+    send_pending_contribution_notification,
+)
+from utils import const, torrent
+from utils.parser import convert_bytes_to_readable
+from utils.youtube import analyze_youtube_video
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================
+# Content Type Detection Patterns
+# ============================================
+
+MAGNET_PATTERN = re.compile(r"magnet:\?xt=urn:btih:[a-zA-Z0-9]{32,40}[^\s]*", re.IGNORECASE)
+NZB_URL_PATTERN = re.compile(r"https?://[^\s]+\.nzb(?:\?[^\s]*)?", re.IGNORECASE)
+# Torrent URL pattern - URLs that likely return torrent file content
+# Matches: .torrent files, /torrent endpoints, /torrents/xxx paths, /download paths
+TORRENT_URL_PATTERN = re.compile(
+    r"https?://[^\s]*(?:"
+    r"\.torrent(?:\?[^\s]*)?"  # URLs ending in .torrent (with optional query)
+    r"|/torrent(?:\?[^\s]+|/[^\s]+)"  # /torrent?params or /torrent/xxx paths
+    r"|/torrents/[^\s]+"  # /torrents/id/... paths
+    r")",
+    re.IGNORECASE,
+)
+YOUTUBE_PATTERN = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)([a-zA-Z0-9_-]{11})",
+    re.IGNORECASE,
+)
+ACESTREAM_PATTERN = re.compile(r"(?:acestream://)?([a-fA-F0-9]{40})", re.IGNORECASE)
+HTTP_URL_PATTERN = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+IMDB_PATTERN = re.compile(r"tt\d{7,8}")
+# Accepts any supported external ID format: tt1234567, tmdb:123, tvdb:456, mal:789, kitsu:012
+EXTERNAL_ID_PATTERN = re.compile(
+    r"(?:tt\d{7,8}|(?:tmdb|tvdb|mal|kitsu):\d+)",
+    re.IGNORECASE,
+)
+
+# Video MIME types
+VIDEO_MIME_TYPES = {
+    "video/mp4",
+    "video/x-matroska",
+    "video/webm",
+    "video/quicktime",
+    "video/x-msvideo",
+    "video/x-flv",
+    "video/mpeg",
+    "video/3gpp",
+    "video/x-ms-wmv",
+}
+
+
+# ============================================
+# Conversation State Management
+# ============================================
+
+
+class ConversationStep(str, Enum):
+    """Steps in the contribution wizard."""
+
+    IDLE = "idle"
+    AWAITING_MEDIA_TYPE = "awaiting_media_type"
+    ANALYZING = "analyzing"
+    AWAITING_MATCH = "awaiting_match"
+    AWAITING_MANUAL_IMDB = "awaiting_manual_imdb"
+    AWAITING_TITLE_SEARCH = "awaiting_title_search"
+    AWAITING_SPORTS_CATEGORY = "awaiting_sports_category"
+    AWAITING_METADATA_REVIEW = "awaiting_metadata_review"
+    AWAITING_FIELD_EDIT = "awaiting_field_edit"
+    AWAITING_POSTER_INPUT = "awaiting_poster_input"  # User is providing poster image
+    AWAITING_EPISODE_INPUT = "awaiting_episode_input"  # User is providing season/episode for series
+    AWAITING_ANONYMOUS_NAME = "awaiting_anonymous_name"  # User is providing temporary anonymous display name
+    AWAITING_CONFIRM = "awaiting_confirm"
+    IMPORTING = "importing"
+
+
+class BatchItemStatus(str, Enum):
+    """Status of a single item within a batch contribution."""
+
+    PENDING_ANALYSIS = "pending_analysis"
+    AUTO_MATCHED = "auto_matched"
+    NEEDS_REVIEW = "needs_review"
+    NO_MATCH = "no_match"
+    IMPORTING = "importing"
+    IMPORTED = "imported"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class ContentType(str, Enum):
+    """Types of content that can be contributed."""
+
+    MAGNET = "magnet"
+    TORRENT_FILE = "torrent_file"
+    TORRENT_URL = "torrent_url"  # URL that returns torrent file content
+    NZB = "nzb"
+    YOUTUBE = "youtube"
+    HTTP = "http"
+    ACESTREAM = "acestream"
+    VIDEO = "video"
+
+
+@dataclass
+class ConversationState:
+    """State for a user's contribution wizard conversation."""
+
+    user_id: int
+    chat_id: int
+    step: ConversationStep = ConversationStep.IDLE
+    content_type: ContentType | None = None
+    raw_input: str | dict | None = None  # magnet link, URL, file_id, torrent bytes, etc.
+    media_type: str | None = None  # movie, series, sports
+    sports_category: str | None = None  # football, basketball, etc.
+    analysis_result: dict | None = None  # from analyze step
+    matches: list[dict] | None = None  # search matches
+    selected_match: dict | None = None  # selected media match (optional for sports)
+    metadata_overrides: dict = field(default_factory=dict)  # user edits
+    editing_field: str | None = None  # field currently being edited
+    message_id: int | None = None  # the wizard message being edited
+    original_message_id: int | None = None  # original content message ID
+    custom_poster_url: str | None = None  # user-provided poster URL
+    anonymous_display_name: str | None = None  # per-contribution anonymous display name
+    batch_item_id: str | None = None  # non-None when this wizard is reviewing a batch item
+    created_at: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = field(default_factory=datetime.now)
+
+    def touch(self):
+        """Update the last activity timestamp."""
+        self.updated_at = datetime.now()
+
+    def is_expired(self, timeout_minutes: int = 30) -> bool:
+        """Check if the conversation has timed out."""
+        return (datetime.now() - self.updated_at) > timedelta(minutes=timeout_minutes)
+
+
+@dataclass
+class BatchItem:
+    """One forwarded video within a user's batch contribution."""
+
+    item_id: str
+    file_id: str
+    file_unique_id: str | None
+    file_name: str | None
+    mime_type: str | None
+    file_size: int | None
+    chat_id: int
+    original_message_id: int | None
+    status: BatchItemStatus = BatchItemStatus.PENDING_ANALYSIS
+    inferred_media_type: str | None = None  # movie | series (derived from PTT)
+    analysis_result: dict | None = None
+    imdb_candidates: list[dict] | None = None
+    selected_match: dict | None = None
+    metadata_overrides: dict = field(default_factory=dict)
+    analysis_task_id: str | None = None
+    import_task_id: str | None = None
+    error: str | None = None
+    created_at: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class BatchState:
+    """Batch of forwarded video items for a single user."""
+
+    batch_id: str
+    user_id: int
+    chat_id: int
+    items: list[BatchItem] = field(default_factory=list)
+    summary_message_id: int | None = None  # bot message ID of the live summary
+    editing_item_id: str | None = None  # item currently being reviewed via wizard
+    created_at: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = field(default_factory=datetime.now)
+
+    def touch(self):
+        self.updated_at = datetime.now()
+
+    def get_item(self, item_id: str) -> "BatchItem | None":
+        for item in self.items:
+            if item.item_id == item_id:
+                return item
+        return None
+
+
+# ============================================
+# Metadata Options for Edit Keyboards
+# ============================================
+
+# Flatten quality groups into a flat list for the picker (exclude None values)
+QUALITY_OPTIONS = [q for qs in const.QUALITY_GROUPS.values() for q in qs if q]
+# Filter out None from resolutions
+RESOLUTION_OPTIONS = [r for r in const.RESOLUTIONS if r]
+# Use the full languages list from const
+LANGUAGE_OPTIONS = [lang for lang in const.LANGUAGES_FILTERS if lang]
+
+# These don't exist in const — keep locally
+CODEC_OPTIONS = ["x265", "HEVC", "x264", "AVC", "AV1", "VP9", "MPEG-4"]
+AUDIO_OPTIONS = ["AAC", "AC3", "DTS", "DTS-HD MA", "TrueHD", "Atmos", "FLAC", "MP3", "EAC3"]
+HDR_OPTIONS = ["HDR10", "HDR10+", "Dolby Vision", "HLG", "SDR", "Unknown"]
+
+_SCRAPE_JOB_TTL = 2 * 60 * 60  # 2h — keeps Redis key alive for duration of the job
+
+
+class TelegramNotifier:
+    def __init__(self):
+        self.bot_token = settings.telegram_bot_token
+        self.chat_id = settings.telegram_chat_id
+        self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
+        self.enabled = bool(self.bot_token and self.chat_id)
+
+    async def send_contribution_notification(
+        self,
+        meta_id: str,
+        title: str,
+        meta_type: str,
+        poster: str,
+        uploader: str,
+        info_hash: str,
+        torrent_type: str,
+        size: str,
+        torrent_name: str,
+        seasons_and_episodes: dict | None = None,
+        catalogs: list | None = None,
+        languages: list | None = None,
+    ):
+        """Send notification about new contribution to Telegram channel"""
+        if not self.enabled:
+            logger.warning("Telegram notifications are disabled. Check bot token.")
+            return
+
+        # Create block URL - will open scraper page with block_torrent action and info hash
+        block_url = f"{settings.host_url}/scraper?action=block_torrent&info_hash={info_hash}"
+        meta_id_data = (
+            f"*IMDb*: [{meta_id}](https://www.imdb.com/title/{meta_id}/)\n"
+            if meta_id.startswith("tt")
+            else f"Meta ID: `{meta_id}`\n"
+        )
+
+        # Build the message
+        message = (
+            f"🎬 New Contribution\n\n"
+            f"*Title*: {title}\n"
+            f"*Type*: {meta_type.title()}\n"
+            f"{meta_id_data}"
+            f"*Uploader*: {uploader}\n"
+            f"*Size*: {size}\n"
+            f"*Torrent Name*: `{torrent_name}`\n"
+            f"*Info Hash*: `{info_hash}`\n"
+            f"*Type*: {torrent_type}\n"
+            f"*Poster*: [View]({poster})\n"
+            f"*Stremio Links*:\n"
+            f"   - *APP*: `stremio:///detail/{meta_type}/{meta_id}/{meta_id}`\n"
+            f"   - *WEB*: [View](https://web.stremio.com/#/detail/{meta_type}/{meta_id}/{meta_id})"
+        )
+
+        if catalogs:
+            # Escape underscores and use pipe with spaces
+            escaped_catalogs = [cat.replace("_", "\\_") for cat in catalogs]
+            message += f"\n*Catalogs*: {', '.join(escaped_catalogs)}"
+        if languages:
+            # Use pipe with spaces for languages
+            message += f"\n*Languages*: {', '.join(languages)}"
+
+        # Add season/episode info for series
+        if meta_type == "series" and seasons_and_episodes:
+            message += "\n*Seasons*: "
+            for season, episodes in seasons_and_episodes.items():
+                message += f"\n- Season {season}: "
+                if len(episodes) == 1:
+                    message += f"{episodes[0]}"
+                else:
+                    message += f"{min(episodes)} - {max(episodes)}"
+            message += "\n"
+
+        # Add block link
+        message += f"\n\n[🚫 Block/Delete Torrent]({block_url})"
+
+        await self._send_photo_message(poster, message)
+
+    @staticmethod
+    def _value_text(value: Any, *, limit: int = 260) -> str:
+        """Format dynamic values safely for Telegram Markdown."""
+        if value is None:
+            return "N/A"
+        text = str(value).replace("`", "'")
+        if len(text) > limit:
+            return text[: limit - 3] + "..."
+        return text
+
+    @staticmethod
+    def _moderator_dashboard_url() -> str:
+        """Frontend moderator dashboard URL."""
+        return f"{settings.host_url}/app/dashboard/moderator"
+
+    @staticmethod
+    def _moderator_annotation_url() -> str:
+        """Frontend moderator annotation queue URL."""
+        return f"{settings.host_url}/app/dashboard/moderator?tab=annotations"
+
+    @staticmethod
+    def _is_http_url(value: Any) -> bool:
+        """Return True for non-empty HTTP(S) URL strings."""
+        return isinstance(value, str) and value.startswith(("http://", "https://"))
+
+    @staticmethod
+    def _display_requester_name(value: Any) -> str:
+        """Format requester name without internal score/id suffixes."""
+        username = TelegramNotifier._value_text(value, limit=80)
+        username = re.sub(r"\s*\(\d+\)\s*$", "", username).strip()
+        if re.fullmatch(r"user\s*#\d+", username, flags=re.IGNORECASE):
+            return "Unknown"
+        return username or "Unknown"
+
+    async def _get_primary_media_poster_url(self, media_id: Any) -> str | None:
+        """Get the primary poster URL for a media ID."""
+        try:
+            normalized_media_id = int(media_id)
+        except (TypeError, ValueError):
+            return None
+
+        try:
+            async with get_async_session_context() as session:
+                poster_result = await session.exec(
+                    select(MediaImage.url)
+                    .where(
+                        MediaImage.media_id == normalized_media_id,
+                        MediaImage.image_type == "poster",
+                    )
+                    .order_by(
+                        MediaImage.is_primary.desc(),
+                        MediaImage.display_order.asc(),
+                        MediaImage.id.asc(),
+                    )
+                    .limit(1)
+                )
+                poster_url = poster_result.first()
+        except Exception as e:
+            logger.error("Failed to fetch poster for media_id=%s: %s", media_id, e)
+            return None
+
+        return poster_url if self._is_http_url(poster_url) else None
+
+    @staticmethod
+    def _format_pending_age(oldest_created_at: datetime | None) -> str:
+        """Format oldest pending age into a compact human-readable string."""
+        if oldest_created_at is None:
+            return "n/a"
+
+        now = datetime.now(tz=oldest_created_at.tzinfo) if oldest_created_at.tzinfo else datetime.now()
+        delta = now - oldest_created_at
+        total_minutes = max(int(delta.total_seconds() // 60), 0)
+
+        days, remainder_minutes = divmod(total_minutes, 24 * 60)
+        hours, minutes = divmod(remainder_minutes, 60)
+
+        if days > 0:
+            return f"{days}d {hours}h"
+        if hours > 0:
+            return f"{hours}h {minutes}m"
+        return f"{minutes}m"
+
+    @staticmethod
+    async def _get_pending_count_and_oldest(session, model, status_filter) -> tuple[int, datetime | None]:
+        """Return pending count and oldest created timestamp for a model."""
+        result = await session.exec(select(func.count(model.id), func.min(model.created_at)).where(status_filter))
+        count, oldest_created_at = result.one()
+        return int(count or 0), oldest_created_at
+
+    async def send_pending_moderation_reminder(self):
+        """Send periodic pending moderation summary to Telegram."""
+        if not self.enabled:
+            logger.debug("Pending moderation reminder skipped: Telegram notifications disabled")
+            return
+
+        try:
+            async with get_async_session_context() as session:
+                contribution_count, contribution_oldest = await self._get_pending_count_and_oldest(
+                    session,
+                    Contribution,
+                    Contribution.status == ContributionStatus.PENDING,
+                )
+                metadata_count, metadata_oldest = await self._get_pending_count_and_oldest(
+                    session,
+                    MetadataSuggestion,
+                    MetadataSuggestion.status == ContributionStatus.PENDING,
+                )
+                stream_count, stream_oldest = await self._get_pending_count_and_oldest(
+                    session,
+                    StreamSuggestion,
+                    StreamSuggestion.status == ContributionStatus.PENDING,
+                )
+                episode_count, episode_oldest = await self._get_pending_count_and_oldest(
+                    session,
+                    EpisodeSuggestion,
+                    EpisodeSuggestion.status == ContributionStatus.PENDING,
+                )
+
+                annotation_result = await session.exec(
+                    text("""
+                        WITH unlinked_streams AS (
+                            SELECT DISTINCT sf.stream_id
+                            FROM stream_file sf
+                            INNER JOIN stream s ON s.id = sf.stream_id
+                            LEFT JOIN file_media_link fml_any ON fml_any.file_id = sf.id
+                            WHERE s.is_active = true
+                              AND s.is_blocked = false
+                              AND fml_any.id IS NULL
+                        ),
+                        null_episode_pairs AS (
+                            SELECT DISTINCT sf.stream_id, fml_series.media_id
+                            FROM stream_file sf
+                            INNER JOIN stream s ON s.id = sf.stream_id
+                            INNER JOIN file_media_link fml_series ON fml_series.file_id = sf.id
+                            INNER JOIN stream_media_link sml
+                                ON sml.stream_id = sf.stream_id
+                               AND sml.media_id = fml_series.media_id
+                            INNER JOIN media m ON m.id = fml_series.media_id
+                            WHERE s.is_active = true
+                              AND s.is_blocked = false
+                              AND m.type = 'SERIES'
+                              AND fml_series.episode_number IS NULL
+                        ),
+                        unmapped_pairs AS (
+                            SELECT DISTINCT
+                                us.stream_id as stream_id,
+                                m.id as media_id
+                            FROM unlinked_streams us
+                            INNER JOIN stream_media_link sml ON sml.stream_id = us.stream_id
+                            INNER JOIN media m ON sml.media_id = m.id
+                            WHERE m.type = 'SERIES'
+                            UNION
+                            SELECT nep.stream_id, nep.media_id
+                            FROM null_episode_pairs nep
+                        ),
+                        annotated_streams AS (
+                            SELECT DISTINCT s.id as stream_id, s.created_at
+                            FROM unmapped_pairs up
+                            INNER JOIN stream s ON s.id = up.stream_id
+                        )
+                        SELECT
+                            COUNT(*) AS total,
+                            MIN(created_at) AS oldest_created_at
+                        FROM annotated_streams
+                    """)
+                )
+                annotation_count, annotation_oldest = annotation_result.one()
+                annotation_count = int(annotation_count or 0)
+        except Exception as e:
+            logger.exception("Failed to build pending moderation reminder: %s", e)
+            return
+
+        queue_items = [
+            {
+                "label": "Content Imports",
+                "count": contribution_count,
+                "oldest": contribution_oldest,
+            },
+            {
+                "label": "Metadata Suggestions",
+                "count": metadata_count,
+                "oldest": metadata_oldest,
+            },
+            {
+                "label": "Stream Suggestions",
+                "count": stream_count,
+                "oldest": stream_oldest,
+            },
+            {
+                "label": "Episode Suggestions",
+                "count": episode_count,
+                "oldest": episode_oldest,
+            },
+            {
+                "label": "File Annotation Requests",
+                "count": annotation_count,
+                "oldest": annotation_oldest,
+            },
+        ]
+        total_pending = sum(item["count"] for item in queue_items)
+        if total_pending == 0:
+            logger.debug("Pending moderation reminder skipped: no pending moderation queues")
+            return
+
+        moderator_url = self._moderator_dashboard_url()
+        message_lines = [
+            "⏰ Pending Moderation Reminder",
+            "",
+            f"*Total Pending*: `{total_pending}`",
+            "",
+            "*Queues:*",
+        ]
+        for item in queue_items:
+            if item["count"] <= 0:
+                continue
+            oldest_age = self._format_pending_age(item["oldest"])
+            message_lines.append(f"- *{item['label']}*: `{item['count']}` pending (oldest `{oldest_age}`)")
+
+        message_lines.extend(
+            [
+                "",
+                f"*Review Dashboard*: [View]({moderator_url})",
+            ]
+        )
+
+        await self._send_text_only_message("\n".join(message_lines).strip())
+
+    async def send_pending_contribution_notification(self, payload: dict[str, Any]):
+        """Send moderator alert when a contribution is pending review."""
+        if not self.enabled:
+            logger.warning("Telegram notifications are disabled. Check bot token.")
+            return
+
+        contribution_data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        contribution_type = self._value_text(payload.get("contribution_type", "unknown"), limit=80)
+        uploader_name = self._value_text(payload.get("uploader_name", "Unknown"), limit=80)
+
+        title = contribution_data.get("title") or contribution_data.get("name")
+        if not title:
+            title = contribution_data.get("url") or contribution_data.get("youtube_url")
+
+        message = f"🆕 Pending User Upload\n\n*Type*: `{contribution_type}`\n*Uploader*: `{uploader_name}`\n"
+
+        if title:
+            message += f"*Title*: `{self._value_text(title, limit=180)}`\n"
+
+        meta_type = contribution_data.get("meta_type")
+        if meta_type:
+            message += f"*Media Type*: `{self._value_text(meta_type, limit=40)}`\n"
+
+        info_hash = contribution_data.get("info_hash")
+        if info_hash:
+            message += f"*Info Hash*: `{self._value_text(info_hash, limit=64)}`\n"
+
+        for key in ("url", "youtube_url", "content_id", "video_id", "nzb_guid"):
+            value = contribution_data.get(key)
+            if value:
+                message += f"*{key.replace('_', ' ').title()}*: `{self._value_text(value, limit=160)}`\n"
+
+        for key in ("languages", "catalogs"):
+            values = contribution_data.get(key)
+            if isinstance(values, list) and values:
+                formatted_values = ", ".join(self._value_text(item, limit=30) for item in values[:8])
+                message += f"*{key.title()}*: `{formatted_values}`\n"
+
+        review_url = self._moderator_dashboard_url()
+        message += f"\n*Review Queue*: [View]({review_url})"
+
+        if info_hash:
+            block_url = f"{settings.host_url}/scraper?action=block_torrent&info_hash={info_hash}"
+            message += f"\n[🚫 Block/Delete Torrent]({block_url})"
+
+        poster = contribution_data.get("poster") or contribution_data.get("image") or contribution_data.get("thumbnail")
+        if self._is_http_url(poster):
+            await self._send_photo_message(poster, message)
+        else:
+            await self._send_text_only_message(message)
+
+    async def send_pending_stream_suggestion_notification(self, payload: dict[str, Any]):
+        """Send moderator alert for pending stream suggestion."""
+        if not self.enabled:
+            logger.warning("Telegram notifications are disabled. Check bot token.")
+            return
+
+        username = self._display_requester_name(payload.get("username"))
+        suggestion_type = self._value_text(payload.get("suggestion_type"), limit=100)
+        field_name = payload.get("field_name")
+        current_value = payload.get("current_value")
+        suggested_value = payload.get("suggested_value")
+        reason = payload.get("reason")
+
+        message = f"🛠️ Pending Stream Suggestion\n\n*Requester*: `{username}`\n*Suggestion Type*: `{suggestion_type}`\n"
+
+        if field_name:
+            message += f"*Field*: `{self._value_text(field_name, limit=80)}`\n"
+        if current_value:
+            message += f"*Current*: `{self._value_text(current_value)}`\n"
+        if suggested_value:
+            message += f"*Suggested*: `{self._value_text(suggested_value)}`\n"
+        if reason:
+            message += f"*Reason*: `{self._value_text(reason)}`\n"
+
+        review_url = self._moderator_dashboard_url()
+        message += f"\n*Review Queue*: [View]({review_url})"
+        await self._send_text_only_message(message)
+
+    async def send_pending_metadata_suggestion_notification(self, payload: dict[str, Any]):
+        """Send moderator alert for pending metadata suggestion."""
+        if not self.enabled:
+            logger.warning("Telegram notifications are disabled. Check bot token.")
+            return
+
+        media_id = payload.get("media_id")
+        media_title = self._value_text(payload.get("media_title"), limit=180)
+        media_type = self._value_text(payload.get("media_type"), limit=40)
+        field_name = self._value_text(payload.get("field_name"), limit=80)
+        username = self._display_requester_name(payload.get("username"))
+        current_value = payload.get("current_value")
+        suggested_value = payload.get("suggested_value")
+        reason = payload.get("reason")
+
+        message = (
+            "📝 Pending Metadata Suggestion\n\n"
+            f"*Requester*: `{username}`\n"
+            f"*Media*: `{media_title}` (`{media_type}`)\n"
+            f"*Field*: `{field_name}`\n"
+        )
+
+        if current_value:
+            message += f"*Current*: `{self._value_text(current_value)}`\n"
+        if suggested_value:
+            message += f"*Suggested*: `{self._value_text(suggested_value)}`\n"
+        if reason:
+            message += f"*Reason*: `{self._value_text(reason)}`\n"
+
+        review_url = self._moderator_dashboard_url()
+        message += f"\n*Review Queue*: [View]({review_url})"
+        poster = payload.get("media_poster_url") or payload.get("poster")
+        if not self._is_http_url(poster):
+            poster = await self._get_primary_media_poster_url(media_id)
+
+        if self._is_http_url(poster):
+            await self._send_photo_message(poster, message)
+        else:
+            await self._send_text_only_message(message)
+
+    async def send_pending_episode_suggestion_notification(self, payload: dict[str, Any]):
+        """Send moderator alert for pending episode suggestion."""
+        if not self.enabled:
+            logger.warning("Telegram notifications are disabled. Check bot token.")
+            return
+
+        series_title = self._value_text(payload.get("series_title"), limit=160)
+        episode_title = self._value_text(payload.get("episode_title"), limit=160)
+        season_number = payload.get("season_number")
+        episode_number = payload.get("episode_number")
+        field_name = self._value_text(payload.get("field_name"), limit=80)
+        username = self._display_requester_name(payload.get("username"))
+        current_value = payload.get("current_value")
+        suggested_value = payload.get("suggested_value")
+        reason = payload.get("reason")
+
+        message = (
+            "📺 Pending Episode Suggestion\n\n"
+            f"*Requester*: `{username}`\n"
+            f"*Series*: `{series_title}`\n"
+            f"*Episode*: `{episode_title}`\n"
+            f"*Field*: `{field_name}`\n"
+        )
+
+        if season_number is not None and episode_number is not None:
+            message += f"*S/E*: `S{self._value_text(season_number)}E{self._value_text(episode_number)}`\n"
+        if current_value:
+            message += f"*Current*: `{self._value_text(current_value)}`\n"
+        if suggested_value:
+            message += f"*Suggested*: `{self._value_text(suggested_value)}`\n"
+        if reason:
+            message += f"*Reason*: `{self._value_text(reason)}`\n"
+
+        review_url = self._moderator_dashboard_url()
+        message += f"\n*Review Queue*: [View]({review_url})"
+        await self._send_text_only_message(message)
+
+    async def send_block_notification(
+        self,
+        info_hash: str,
+        action: str,
+        meta_id: str,
+        title: str,
+        meta_type: str,
+        poster: str,
+        torrent_name: str,
+    ):
+        """Send notification when a torrent is blocked"""
+        if not self.enabled:
+            logger.warning("Telegram notifications are disabled. Check bot token.")
+            return
+
+        meta_id_data = (
+            f"*IMDb*: [{meta_id}](https://www.imdb.com/title/{meta_id}/)\n"
+            if meta_id.startswith("tt")
+            else f"Meta ID: {meta_id}\n"
+        )
+
+        message = (
+            f"🚫 Torrent {'Blocked' if action == 'block' else 'Deleted'}\n\n"
+            f"*Title*: {title}\n"
+            f"*Type*: {meta_type.title()}\n"
+            f"{meta_id_data}"
+            f"*Torrent Name*: `{torrent_name}`\n"
+            f"*Info Hash*: `{info_hash}`\n"
+            f"*Poster*: [View]({poster})"
+        )
+
+        await self._send_photo_message(poster, message)
+
+    async def send_migration_notification(
+        self,
+        old_id: str,
+        new_id: str,
+        title: str,
+        meta_type: str,
+        poster: str,
+    ):
+        """Send notification when an ID is migrated"""
+        if not self.enabled:
+            logger.warning("Telegram notifications are disabled. Check bot token.")
+            return
+
+        message = (
+            f"🔄 ID Migration Complete\n\n"
+            f"*Title*: {title}\n"
+            f"*Type*: {meta_type.title()}\n"
+            f"*Old ID*: `{old_id}`\n"
+            f"*New IMDb ID*: [{new_id}](https://www.imdb.com/title/{new_id}/)\n"
+            f"*Poster*: [View]({poster})"
+        )
+
+        await self._send_photo_message(poster, message)
+
+    async def send_image_update_notification(
+        self,
+        meta_id: str,
+        title: str,
+        meta_type: str,
+        poster: str,
+        old_poster: str | None = None,
+        new_poster: str | None = None,
+        old_background: str | None = None,
+        new_background: str | None = None,
+        old_logo: str | None = None,
+        new_logo: str | None = None,
+    ):
+        """Send notification when images are updated"""
+        if not self.enabled:
+            logger.warning("Telegram notifications are disabled. Check bot token.")
+            return
+
+        meta_id_data = (
+            f"*IMDb*: [{meta_id}](https://www.imdb.com/title/{meta_id}/)\n"
+            if meta_id.startswith("tt")
+            else f"Meta ID: {meta_id}\n"
+        )
+
+        message = (
+            f"🖼️ Images Updated\n\n"
+            f"*Title*: {title}\n"
+            f"*Type*: {meta_type.title()}\n"
+            f"{meta_id_data}"
+            f"*Old Poster*: [View]({old_poster})\n"
+            f"*Old Background*: [View]({old_background})\n"
+            f"*Old Logo*: [View]({old_logo})\n"
+        )
+
+        # Add details about what was updated
+        if new_poster:
+            message += f"\n*Poster*: Updated ✅ [View]({new_poster})"
+        if new_background:
+            message += f"\n*Background*: Updated ✅ [View]({new_background})"
+        if new_logo:
+            message += f"\n*Logo*: Updated ✅ [View]({new_logo})"
+
+        message += f"\n\n*Preview*: [View]({poster})"
+
+        await self._send_photo_message(poster, message)
+
+    async def _send_photo_message(self, photo_url: str, message: str):
+        """Send a message with photo, falling back to text-only if photo fails"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.base_url}/sendPhoto",
+                    json={
+                        "chat_id": self.chat_id,
+                        "photo": photo_url,
+                        "caption": message,
+                        "parse_mode": "Markdown",
+                    },
+                ) as response:
+                    if not response.ok:
+                        error_data = await response.json()
+                        logger.error(f"Failed to send Telegram notification: {error_data}")
+                        # Fallback to text-only message if photo fails
+                        await self._send_text_only_message(message)
+                    return await response.json()
+        except Exception as e:
+            logger.error(f"Error sending Telegram notification: {e}")
+            # Fallback to text-only message if there's an error
+            await self._send_text_only_message(message)
+
+    async def _send_text_only_message(self, message: str):
+        """Fallback method to send text-only message if photo sending fails"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                await session.post(
+                    f"{self.base_url}/sendMessage",
+                    json={
+                        "chat_id": self.chat_id,
+                        "text": message,
+                        "parse_mode": "Markdown",
+                        "disable_web_page_preview": False,
+                    },
+                )
+        except Exception as e:
+            logger.error(f"Error sending fallback text message: {e}")
+
+    async def send_file_annotation_request(self, info_hash: str, torrent_name: str):
+        """Send notification to request episode annotations"""
+        if not self.enabled:
+            logger.warning("Telegram notifications are disabled. Check bot token.")
+            return
+
+        annotation_url = self._moderator_annotation_url()
+        message = (
+            "📝 Episode file mapping required\n\n"
+            f"*Info Hash*: `{info_hash}`\n"
+            f"*Torrent Name*: `{torrent_name}`\n"
+            f"*Annotation Queue*: [Open]({annotation_url})\n"
+            "Please review and annotate the episode mappings manually."
+        )
+
+        await self._send_text_only_message(message)
+
+    async def send_content_received_notification(
+        self,
+        file_name: str,
+        file_size: int,
+        status: str = "received",
+        meta_id: str | None = None,
+        title: str | None = None,
+        error_message: str | None = None,
+    ):
+        """Send notification about received content.
+
+        Used for bot-forwarded content feature where users can send
+        videos to the MediaFusion bot for processing.
+
+        Args:
+            file_name: Name of the received file
+            file_size: Size of the file in bytes
+            status: Status of processing (received, processing, stored, failed)
+            meta_id: Matched media ID (if identified)
+            title: Matched media title (if identified)
+            error_message: Error message if processing failed
+        """
+        if not self.enabled:
+            logger.warning("Telegram notifications are disabled. Check bot token.")
+            return
+
+        # Format file size
+        if file_size >= 1024 * 1024 * 1024:
+            size_str = f"{file_size / (1024 * 1024 * 1024):.2f} GB"
+        elif file_size >= 1024 * 1024:
+            size_str = f"{file_size / (1024 * 1024):.2f} MB"
+        else:
+            size_str = f"{file_size / 1024:.2f} KB"
+
+        # Build status emoji
+        status_emoji = {
+            "received": "📥",
+            "processing": "⏳",
+            "stored": "✅",
+            "failed": "❌",
+        }.get(status, "📥")
+
+        message = f"{status_emoji} Content {status.title()}\n\n*File*: `{file_name}`\n*Size*: {size_str}\n"
+
+        if meta_id and title:
+            message += f"*Matched*: [{title}](https://www.imdb.com/title/{meta_id}/)\n"
+        elif status == "failed" and error_message:
+            message += f"*Error*: {error_message}\n"
+
+        await self._send_text_only_message(message)
+
+
+class TelegramContentBot:
+    """
+    Interactive bot handler for content contribution.
+
+    This class handles the full content contribution workflow via Telegram:
+    - Detects content type (magnet, torrent, NZB, YouTube, HTTP, AceStream, video)
+    - Guides users through a multi-step wizard using inline keyboards
+    - Analyzes content and searches for metadata matches
+    - Allows metadata review and editing before import
+    - Creates streams and contributions in the database
+
+    Supported content types:
+    - Magnet links (magnet:?xt=urn:btih:...)
+    - Torrent files (.torrent uploads)
+    - NZB URLs (https://.../.nzb)
+    - YouTube URLs (youtube.com/watch, youtu.be)
+    - HTTP direct links (video URLs)
+    - AceStream IDs (40-char hex)
+    - Video files (forwarded videos/documents)
+
+    Usage flow:
+    1. User sends content (link, file, or video)
+    2. Bot detects content type and shows media type selection
+    3. User selects movie/series/sports
+    4. Bot analyzes content and shows metadata matches
+    5. User selects match or enters external ID manually
+    6. Bot shows metadata review with edit options
+    7. User confirms import
+    8. Bot creates stream and shows success message
+    """
+
+    def __init__(self):
+        self.bot_token = settings.telegram_bot_token
+        self.base_url = f"https://api.telegram.org/bot{self.bot_token}" if self.bot_token else None
+        self.enabled = bool(self.bot_token)
+        self._conversation_ttl_seconds = 30 * 60
+        self._batch_ttl_seconds = 2 * 60 * 60  # 2 hours
+        self._bot_identity_cache_ttl_seconds = 3600
+        self._cached_bot_id: int | None = None
+        self._cached_bot_username: str | None = None
+        self._bot_identity_checked_at: float = 0.0
+
+    def _conversation_key(self, user_id: int) -> str:
+        return f"telegram:conversation:{user_id}"
+
+    def _batch_key(self, user_id: int) -> str:
+        return f"telegram:batch:{user_id}"
+
+    def _pending_content_key(self, user_id: int) -> str:
+        return f"telegram:pending_content:{user_id}"
+
+    def _search_result_key(self, callback_data: str) -> str:
+        return f"telegram:search_result:{callback_data}"
+
+    def _user_mapping_key(self, telegram_user_id: int) -> str:
+        return f"telegram:user_mapping:{telegram_user_id}"
+
+    async def get_bot_identity(self) -> tuple[int | None, str | None]:
+        """Return bot (id, username) from getMe with lightweight in-process caching."""
+        if not self.enabled or not self.base_url:
+            return None, None
+
+        now = monotonic()
+        if (
+            self._bot_identity_checked_at > 0
+            and (now - self._bot_identity_checked_at) < self._bot_identity_cache_ttl_seconds
+        ):
+            return self._cached_bot_id, self._cached_bot_username
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{self.base_url}/getMe") as response:
+                    response_data = await response.json()
+                    if response.ok and response_data.get("ok"):
+                        result = response_data.get("result", {})
+                        raw_id = result.get("id")
+                        username = result.get("username")
+                        self._cached_bot_id = int(raw_id) if raw_id is not None else None
+                        self._cached_bot_username = str(username).strip().lstrip("@") if username else None
+                        self._bot_identity_checked_at = now
+                        return self._cached_bot_id, self._cached_bot_username
+
+                    logger.warning(
+                        "Failed to resolve Telegram bot identity via getMe: %s",
+                        response_data.get("description", "Unknown error"),
+                    )
+        except Exception as exc:
+            logger.warning("Error resolving Telegram bot identity via getMe: %s", exc)
+
+        # Prevent repeated getMe calls on every playback when the API is failing.
+        self._bot_identity_checked_at = now
+        return self._cached_bot_id, self._cached_bot_username
+
+    async def get_mediaflow_bot_peer(self) -> str | None:
+        """Resolve preferred MediaFlow peer identifier for bot DM access."""
+        configured_username = (settings.telegram_bot_username or "").strip().lstrip("@")
+        bot_id, resolved_username = await self.get_bot_identity()
+
+        if configured_username:
+            # If configured username doesn't match getMe, prefer stable numeric bot ID.
+            if resolved_username and configured_username.lower() != resolved_username.lower():
+                logger.warning(
+                    "Configured TELEGRAM_BOT_USERNAME (%s) differs from getMe username (%s). "
+                    "Using numeric bot ID fallback for MediaFlow.",
+                    configured_username,
+                    resolved_username,
+                )
+                if bot_id:
+                    return str(bot_id)
+            return f"@{configured_username}"
+
+        if bot_id:
+            return str(bot_id)
+        if resolved_username:
+            return f"@{resolved_username}"
+        return None
+
+    # ---- pending_content helpers ----
+
+    def _get_pending_content(self, user_id: int) -> list:
+        try:
+            raw = REDIS_SYNC_CLIENT.get(self._pending_content_key(user_id))
+            return json.loads(raw) if raw else []
+        except Exception as e:
+            logger.debug(f"Failed to load pending content from Redis for user {user_id}: {e}")
+            return []
+
+    def _set_pending_content(self, user_id: int, items: list):
+        try:
+            REDIS_SYNC_CLIENT.setex(
+                self._pending_content_key(user_id),
+                2 * 60 * 60,  # 2 hours
+                json.dumps(items),
+            )
+        except Exception as e:
+            logger.debug(f"Failed to persist pending content to Redis for user {user_id}: {e}")
+
+    def _delete_pending_content(self, user_id: int):
+        try:
+            REDIS_SYNC_CLIENT.delete(self._pending_content_key(user_id))
+        except Exception as e:
+            logger.debug(f"Failed to delete pending content from Redis for user {user_id}: {e}")
+
+    # ---- search_result helpers ----
+
+    def _get_search_result(self, callback_data: str) -> dict | None:
+        try:
+            raw = REDIS_SYNC_CLIENT.get(self._search_result_key(callback_data))
+            return json.loads(raw) if raw else None
+        except Exception as e:
+            logger.debug(f"Failed to load search result from Redis: {e}")
+            return None
+
+    def _set_search_result(self, callback_data: str, data: dict):
+        try:
+            REDIS_SYNC_CLIENT.setex(
+                self._search_result_key(callback_data),
+                30 * 60,  # 30 minutes
+                json.dumps(data),
+            )
+        except Exception as e:
+            logger.debug(f"Failed to persist search result to Redis: {e}")
+
+    def _delete_search_result(self, callback_data: str):
+        try:
+            REDIS_SYNC_CLIENT.delete(self._search_result_key(callback_data))
+        except Exception as e:
+            logger.debug(f"Failed to delete search result from Redis: {e}")
+
+    def _to_json_safe(self, value: Any) -> Any:
+        """Convert nested values to JSON-safe structures for Redis storage."""
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, Enum):
+            return value.value
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, bytes):
+            return None
+        if isinstance(value, list):
+            return [self._to_json_safe(v) for v in value]
+        if isinstance(value, dict):
+            return {k: self._to_json_safe(v) for k, v in value.items()}
+        return str(value)
+
+    def _serialize_state(self, state: ConversationState) -> str:
+        payload = {
+            "user_id": state.user_id,
+            "chat_id": state.chat_id,
+            "step": state.step.value,
+            "content_type": state.content_type.value if state.content_type else None,
+            "raw_input": self._to_json_safe(state.raw_input),
+            "media_type": state.media_type,
+            "sports_category": state.sports_category,
+            "analysis_result": self._to_json_safe(state.analysis_result),
+            "matches": self._to_json_safe(state.matches),
+            "selected_match": self._to_json_safe(state.selected_match),
+            "metadata_overrides": self._to_json_safe(state.metadata_overrides),
+            "editing_field": state.editing_field,
+            "message_id": state.message_id,
+            "original_message_id": state.original_message_id,
+            "custom_poster_url": state.custom_poster_url,
+            "anonymous_display_name": state.anonymous_display_name,
+            "batch_item_id": state.batch_item_id,
+            "created_at": state.created_at.isoformat(),
+            "updated_at": state.updated_at.isoformat(),
+        }
+        return json.dumps(payload)
+
+    def _deserialize_state(self, data: str | bytes) -> ConversationState | None:
+        try:
+            if isinstance(data, bytes):
+                data = data.decode("utf-8")
+            payload = json.loads(data)
+            return ConversationState(
+                user_id=int(payload["user_id"]),
+                chat_id=int(payload["chat_id"]),
+                step=ConversationStep(payload.get("step", ConversationStep.IDLE.value)),
+                content_type=ContentType(payload["content_type"]) if payload.get("content_type") else None,
+                raw_input=payload.get("raw_input"),
+                media_type=payload.get("media_type"),
+                sports_category=payload.get("sports_category"),
+                analysis_result=payload.get("analysis_result"),
+                matches=payload.get("matches"),
+                selected_match=payload.get("selected_match"),
+                metadata_overrides=payload.get("metadata_overrides") or {},
+                editing_field=payload.get("editing_field"),
+                message_id=payload.get("message_id"),
+                original_message_id=payload.get("original_message_id"),
+                custom_poster_url=payload.get("custom_poster_url"),
+                anonymous_display_name=payload.get("anonymous_display_name"),
+                batch_item_id=payload.get("batch_item_id"),
+                created_at=datetime.fromisoformat(payload.get("created_at"))
+                if payload.get("created_at")
+                else datetime.now(),
+                updated_at=datetime.fromisoformat(payload.get("updated_at"))
+                if payload.get("updated_at")
+                else datetime.now(),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to deserialize conversation state: {e}")
+            return None
+
+    def _persist_conversation(self, state: ConversationState):
+        """Persist state to Redis so it survives multi-worker routing."""
+        try:
+            REDIS_SYNC_CLIENT.setex(
+                self._conversation_key(state.user_id),
+                self._conversation_ttl_seconds,
+                self._serialize_state(state),
+            )
+        except Exception as e:
+            logger.debug(f"Failed to persist conversation to Redis for user {state.user_id}: {e}")
+
+    # ============================================
+    # Batch State Management
+    # ============================================
+
+    def _serialize_batch_item(self, item: BatchItem) -> dict:
+        return {
+            "item_id": item.item_id,
+            "file_id": item.file_id,
+            "file_unique_id": item.file_unique_id,
+            "file_name": item.file_name,
+            "mime_type": item.mime_type,
+            "file_size": item.file_size,
+            "chat_id": item.chat_id,
+            "original_message_id": item.original_message_id,
+            "status": item.status.value,
+            "inferred_media_type": item.inferred_media_type,
+            "analysis_result": self._to_json_safe(item.analysis_result),
+            "imdb_candidates": self._to_json_safe(item.imdb_candidates),
+            "selected_match": self._to_json_safe(item.selected_match),
+            "metadata_overrides": self._to_json_safe(item.metadata_overrides),
+            "analysis_task_id": item.analysis_task_id,
+            "import_task_id": item.import_task_id,
+            "error": item.error,
+            "created_at": item.created_at.isoformat(),
+        }
+
+    def _deserialize_batch_item(self, data: dict) -> BatchItem:
+        return BatchItem(
+            item_id=data["item_id"],
+            file_id=data["file_id"],
+            file_unique_id=data.get("file_unique_id"),
+            file_name=data.get("file_name"),
+            mime_type=data.get("mime_type"),
+            file_size=data.get("file_size"),
+            chat_id=int(data["chat_id"]),
+            original_message_id=data.get("original_message_id"),
+            status=BatchItemStatus(data.get("status", BatchItemStatus.PENDING_ANALYSIS.value)),
+            inferred_media_type=data.get("inferred_media_type"),
+            analysis_result=data.get("analysis_result"),
+            imdb_candidates=data.get("imdb_candidates"),
+            selected_match=data.get("selected_match"),
+            metadata_overrides=data.get("metadata_overrides") or {},
+            analysis_task_id=data.get("analysis_task_id"),
+            import_task_id=data.get("import_task_id"),
+            error=data.get("error"),
+            created_at=datetime.fromisoformat(data["created_at"]) if data.get("created_at") else datetime.now(),
+        )
+
+    def _serialize_batch(self, batch: BatchState) -> str:
+        return json.dumps(
+            {
+                "batch_id": batch.batch_id,
+                "user_id": batch.user_id,
+                "chat_id": batch.chat_id,
+                "items": [self._serialize_batch_item(i) for i in batch.items],
+                "summary_message_id": batch.summary_message_id,
+                "editing_item_id": batch.editing_item_id,
+                "created_at": batch.created_at.isoformat(),
+                "updated_at": batch.updated_at.isoformat(),
+            }
+        )
+
+    def _deserialize_batch(self, data: str | bytes) -> BatchState | None:
+        try:
+            if isinstance(data, bytes):
+                data = data.decode("utf-8")
+            payload = json.loads(data)
+            return BatchState(
+                batch_id=payload["batch_id"],
+                user_id=int(payload["user_id"]),
+                chat_id=int(payload["chat_id"]),
+                items=[self._deserialize_batch_item(i) for i in payload.get("items", [])],
+                summary_message_id=payload.get("summary_message_id"),
+                editing_item_id=payload.get("editing_item_id"),
+                created_at=datetime.fromisoformat(payload["created_at"])
+                if payload.get("created_at")
+                else datetime.now(),
+                updated_at=datetime.fromisoformat(payload["updated_at"])
+                if payload.get("updated_at")
+                else datetime.now(),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to deserialize batch state: {e}")
+            return None
+
+    def get_batch(self, user_id: int) -> BatchState | None:
+        try:
+            raw = REDIS_SYNC_CLIENT.get(self._batch_key(user_id))
+            return self._deserialize_batch(raw) if raw else None
+        except Exception as e:
+            logger.debug(f"Failed to load batch from Redis for user {user_id}: {e}")
+            return None
+
+    async def aget_batch(self, user_id: int) -> BatchState | None:
+        try:
+            raw = await REDIS_ASYNC_CLIENT.get(self._batch_key(user_id))
+            return self._deserialize_batch(raw) if raw else None
+        except Exception as e:
+            logger.debug(f"Failed to async-load batch from Redis for user {user_id}: {e}")
+            return None
+
+    def _set_batch(self, batch: BatchState):
+        try:
+            REDIS_SYNC_CLIENT.setex(
+                self._batch_key(batch.user_id), self._batch_ttl_seconds, self._serialize_batch(batch)
+            )
+        except Exception as e:
+            logger.debug(f"Failed to persist batch to Redis for user {batch.user_id}: {e}")
+
+    async def _aset_batch(self, batch: BatchState):
+        try:
+            await REDIS_ASYNC_CLIENT.setex(
+                self._batch_key(batch.user_id), self._batch_ttl_seconds, self._serialize_batch(batch)
+            )
+        except Exception as e:
+            logger.debug(f"Failed to async-persist batch to Redis for user {batch.user_id}: {e}")
+
+    def clear_batch(self, user_id: int):
+        try:
+            REDIS_SYNC_CLIENT.delete(self._batch_key(user_id))
+        except Exception:
+            pass
+
+    async def _send_message_get_id(self, chat_id: int, text: str, reply_markup: dict | None = None) -> int | None:
+        """Send a message and return the resulting message_id, or None on failure."""
+        if not self.enabled:
+            return None
+        try:
+            payload: dict = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+            if reply_markup:
+                payload["reply_markup"] = reply_markup
+            async with aiohttp.ClientSession() as session:
+                async with session.post(f"{self.base_url}/sendMessage", json=payload) as response:
+                    data = await response.json()
+                    if data.get("ok"):
+                        return data["result"]["message_id"]
+                    logger.error(f"sendMessage failed: {data.get('description')}")
+        except Exception as e:
+            logger.error(f"Error sending batch summary message: {e}")
+        return None
+
+    def _batch_status_counts(self, batch: BatchState) -> dict[BatchItemStatus, int]:
+        counts: dict[BatchItemStatus, int] = {}
+        for item in batch.items:
+            counts[item.status] = counts.get(item.status, 0) + 1
+        return counts
+
+    def _build_batch_summary_text(self, batch: BatchState) -> str:
+        c = self._batch_status_counts(batch)
+        S = BatchItemStatus
+        total = len(batch.items)
+        lines = [f"📦 *Batch — {total} item{'s' if total != 1 else ''}*\n"]
+        for status, emoji, label in (
+            (S.PENDING_ANALYSIS, "⏳", "analyzing"),
+            (S.AUTO_MATCHED, "✅", "auto-matched"),
+            (S.NEEDS_REVIEW, "⚠️", "need review"),
+            (S.NO_MATCH, "❌", "no match"),
+            (S.IMPORTING, "📥", "importing"),
+            (S.IMPORTED, "🎬", "imported"),
+            (S.FAILED, "💔", "failed"),
+            (S.SKIPPED, "⏭", "skipped"),
+        ):
+            n = c.get(status, 0)
+            if n:
+                lines.append(f"{emoji} {n} {label}")
+        return "\n".join(lines)
+
+    def _build_batch_keyboard(self, batch: BatchState) -> list[list[dict]]:
+        c = self._batch_status_counts(batch)
+        S = BatchItemStatus
+        uid = batch.user_id
+        auto_matched = c.get(S.AUTO_MATCHED, 0)
+        needs_review = c.get(S.NEEDS_REVIEW, 0)
+        no_match = c.get(S.NO_MATCH, 0)
+        still_active = auto_matched + needs_review + no_match + c.get(S.PENDING_ANALYSIS, 0) + c.get(S.IMPORTING, 0)
+
+        rows: list[list[dict]] = []
+        if auto_matched:
+            rows.append([{"text": f"✅ Import {auto_matched} auto-matched", "callback_data": f"batch:import:{uid}"}])
+        if needs_review:
+            rows.append([{"text": f"⚠️ Review {needs_review} ambiguous", "callback_data": f"batch:review:{uid}"}])
+        if no_match:
+            rows.append([{"text": f"❌ Skip {no_match} unmatched", "callback_data": f"batch:skip_unmatched:{uid}"}])
+        if still_active:
+            rows.append([{"text": "🗑 Cancel batch", "callback_data": f"batch:cancel:{uid}"}])
+        return rows
+
+    async def render_batch_summary(self, batch: BatchState) -> None:
+        """Edit (or send) the live batch summary message in the user's chat."""
+        text = self._build_batch_summary_text(batch)
+        keyboard = self._build_batch_keyboard(batch)
+        reply_markup = {"inline_keyboard": keyboard} if keyboard else None
+
+        if batch.summary_message_id:
+            await self.edit_message(batch.chat_id, batch.summary_message_id, text, reply_markup)
+        else:
+            msg_id = await self._send_message_get_id(batch.chat_id, text, reply_markup)
+            if msg_id:
+                batch.summary_message_id = msg_id
+                await self._aset_batch(batch)
+
+    async def append_to_batch(
+        self,
+        user_id: int,
+        chat_id: int,
+        file_info: dict,
+        original_message_id: int | None,
+    ) -> dict:
+        """Accept a forwarded video into the user's batch and trigger background analysis."""
+        from utils.telegram_tasks import analyze_telegram_item  # noqa: PLC0415
+
+        batch = self.get_batch(user_id)
+        if batch is None:
+            batch = BatchState(
+                batch_id=str(uuid.uuid4()),
+                user_id=user_id,
+                chat_id=chat_id,
+            )
+
+        item = BatchItem(
+            item_id=str(uuid.uuid4()),
+            file_id=file_info.get("file_id", ""),
+            file_unique_id=file_info.get("file_unique_id"),
+            file_name=file_info.get("file_name"),
+            mime_type=file_info.get("mime_type"),
+            file_size=file_info.get("file_size"),
+            chat_id=chat_id,
+            original_message_id=original_message_id,
+        )
+        batch.items.append(item)
+        batch.touch()
+        self._set_batch(batch)
+
+        await self.render_batch_summary(batch)
+
+        asyncio.create_task(analyze_telegram_item(user_id, item.item_id))
+
+        n = len(batch.items)
+        return {"success": True, "message": f"📥 Added to batch ({n} item{'s' if n != 1 else ''})"}
+
+    async def handle_batch_import(self, user_id: int, chat_id: int, message_id: int) -> None:
+        """Enqueue import for all AUTO_MATCHED items in the batch."""
+        from utils.telegram_tasks import import_telegram_item  # noqa: PLC0415
+
+        batch = self.get_batch(user_id)
+        if not batch:
+            await self.edit_message(chat_id, message_id, "⚠️ Batch not found or expired.")
+            return
+
+        to_import = [i for i in batch.items if i.status == BatchItemStatus.AUTO_MATCHED]
+        for item in to_import:
+            item.status = BatchItemStatus.IMPORTING
+        # Persist before launching tasks so they see IMPORTING status
+        batch.touch()
+        self._set_batch(batch)
+
+        for item in to_import:
+            asyncio.create_task(import_telegram_item(user_id, item.item_id))
+        self._set_batch(batch)
+        await self.render_batch_summary(batch)
+
+    async def show_batch_review_list(self, user_id: int, chat_id: int, message_id: int) -> None:
+        """Show paginated list of NEEDS_REVIEW items for per-item edit."""
+        batch = self.get_batch(user_id)
+        if not batch:
+            await self.edit_message(chat_id, message_id, "⚠️ Batch not found or expired.")
+            return
+
+        review_items = [i for i in batch.items if i.status in (BatchItemStatus.NEEDS_REVIEW, BatchItemStatus.NO_MATCH)]
+        if not review_items:
+            await self.edit_message(chat_id, message_id, "✅ No items need review.")
+            return
+
+        text = "📝 *Items needing review:*\n\nTap an item to resolve it:"
+        keyboard = []
+        for item in review_items[:10]:  # show up to 10 at a time
+            name = (item.file_name or "Unknown")[:40]
+            status_emoji = "⚠️" if item.status == BatchItemStatus.NEEDS_REVIEW else "❌"
+            keyboard.append(
+                [
+                    {
+                        "text": f"{status_emoji} {name}",
+                        "callback_data": f"batch:item:{user_id}:{item.item_id}",
+                    }
+                ]
+            )
+        keyboard.append([{"text": "← Back to batch", "callback_data": f"batch:summary:{user_id}"}])
+        await self.edit_message(chat_id, message_id, text, {"inline_keyboard": keyboard})
+
+    async def start_batch_item_wizard(self, user_id: int, chat_id: int, message_id: int, item_id: str) -> None:
+        """Open the existing wizard for a single batch item."""
+        batch = self.get_batch(user_id)
+        if not batch:
+            await self.edit_message(chat_id, message_id, "⚠️ Batch not found or expired.")
+            return
+
+        item = batch.get_item(item_id)
+        if not item:
+            await self.edit_message(chat_id, message_id, "⚠️ Item not found.")
+            return
+
+        batch.editing_item_id = item_id
+        batch.touch()
+        self._set_batch(batch)
+
+        raw_input = {
+            "file_id": item.file_id,
+            "file_unique_id": item.file_unique_id,
+            "file_name": item.file_name,
+            "file_size": item.file_size,
+            "mime_type": item.mime_type,
+        }
+        state = ConversationState(
+            user_id=user_id,
+            chat_id=chat_id,
+            content_type=ContentType.VIDEO,
+            raw_input=raw_input,
+            media_type=item.inferred_media_type,
+            analysis_result=item.analysis_result,
+            matches=item.imdb_candidates,
+            metadata_overrides=item.metadata_overrides or {},
+            message_id=message_id,
+            original_message_id=item.original_message_id,
+            batch_item_id=item_id,
+            step=ConversationStep.AWAITING_MEDIA_TYPE,
+        )
+        self._persist_conversation(state)
+
+        if item.analysis_result and item.imdb_candidates is not None and item.inferred_media_type:
+            state.step = ConversationStep.AWAITING_MATCH
+            self._persist_conversation(state)
+            await self.show_matches(state, chat_id, message_id)
+        else:
+            keyboard = self._build_media_type_keyboard(user_id)
+            keyboard.insert(0, [{"text": "← Back to batch", "callback_data": f"batch:summary:{user_id}"}])
+            preview = self._get_content_preview(ContentType.VIDEO, raw_input)
+            await self.edit_message(
+                chat_id,
+                message_id,
+                f"🎬 *Video File Detected*\n\n{preview}\n\nSelect the content type:",
+                {"inline_keyboard": keyboard},
+            )
+
+    async def finish_batch_item_review(
+        self, user_id: int, item_id: str, success: bool, error: str | None = None
+    ) -> None:
+        """Called when a per-item wizard completes (confirm or cancel)."""
+        batch = self.get_batch(user_id)
+        if not batch:
+            return
+        item = batch.get_item(item_id)
+        if item:
+            if success:
+                item.status = BatchItemStatus.IMPORTED
+            else:
+                # Revert to NEEDS_REVIEW so user can retry
+                item.status = BatchItemStatus.NEEDS_REVIEW
+            item.error = error
+        batch.editing_item_id = None
+        batch.touch()
+        self._set_batch(batch)
+        await self.render_batch_summary(batch)
+
+    # ============================================
+    # Content Type Detection
+    # ============================================
+
+    @staticmethod
+    def _extract_urls_from_entities(message: dict) -> list[str]:
+        """Extract URLs from Telegram message entities.
+
+        Telegram stores hyperlinks in two ways:
+        - 'url' entity type: the URL is in the text itself
+        - 'text_link' entity type: the URL is in entity.url (text shows display label)
+
+        Also checks caption_entities for media messages.
+        """
+        urls: list[str] = []
+        text = message.get("text", "") or ""
+        caption = message.get("caption", "") or ""
+
+        for entities_key, source_text in [("entities", text), ("caption_entities", caption)]:
+            for entity in message.get(entities_key, []):
+                entity_type = entity.get("type", "")
+                if entity_type == "text_link":
+                    # URL is in entity.url, not in the text
+                    url = entity.get("url", "")
+                    if url:
+                        urls.append(url)
+                elif entity_type == "url":
+                    # URL is in the text itself
+                    offset = entity.get("offset", 0)
+                    length = entity.get("length", 0)
+                    url = source_text[offset : offset + length]
+                    if url:
+                        urls.append(url)
+        return urls
+
+    def detect_content_type(self, message: dict) -> tuple[ContentType | None, Any]:
+        """Detect content type from a Telegram message.
+
+        Checks plain text, caption, and entity-embedded URLs (text_link).
+
+        Args:
+            message: Telegram message dict
+
+        Returns:
+            Tuple of (ContentType, raw_data) or (None, None) if not recognized
+        """
+        text = message.get("text", "") or message.get("caption", "") or ""
+        document = message.get("document")
+        video = message.get("video")
+
+        # Extract URLs from entities (handles text_link markdown links)
+        entity_urls = self._extract_urls_from_entities(message)
+
+        # Check for video first
+        if video:
+            return ContentType.VIDEO, {
+                "file_id": video.get("file_id"),
+                "file_unique_id": video.get("file_unique_id"),
+                "file_name": video.get("file_name"),
+                "file_size": video.get("file_size"),
+                "mime_type": video.get("mime_type"),
+            }
+
+        # Check for document (could be video or torrent file)
+        if document:
+            mime_type = document.get("mime_type", "")
+            file_name = document.get("file_name", "")
+
+            # Check for torrent file
+            if mime_type == "application/x-bittorrent" or file_name.endswith(".torrent"):
+                return ContentType.TORRENT_FILE, {
+                    "file_id": document.get("file_id"),
+                    "file_name": file_name,
+                    "file_size": document.get("file_size"),
+                }
+
+            # Check for video document
+            if mime_type in VIDEO_MIME_TYPES or any(
+                file_name.lower().endswith(ext) for ext in [".mkv", ".mp4", ".avi", ".webm", ".mov"]
+            ):
+                return ContentType.VIDEO, {
+                    "file_id": document.get("file_id"),
+                    "file_unique_id": document.get("file_unique_id"),
+                    "file_name": file_name,
+                    "file_size": document.get("file_size"),
+                    "mime_type": mime_type,
+                }
+
+        # Build a combined text that includes both plain text and entity URLs.
+        # This ensures URLs from text_link entities (markdown-style links) are checked.
+        all_texts = [text] + entity_urls
+
+        for candidate in all_texts:
+            if not candidate:
+                continue
+
+            # Magnet link
+            magnet_match = MAGNET_PATTERN.search(candidate)
+            if magnet_match:
+                return ContentType.MAGNET, magnet_match.group(0)
+
+            # NZB URL
+            nzb_match = NZB_URL_PATTERN.search(candidate)
+            if nzb_match:
+                return ContentType.NZB, nzb_match.group(0)
+
+            # Torrent URL (URLs that return torrent file content)
+            # Check before generic HTTP - patterns like /torrent, /torrents/, .torrent
+            torrent_url_match = TORRENT_URL_PATTERN.search(candidate)
+            if torrent_url_match:
+                return ContentType.TORRENT_URL, torrent_url_match.group(0)
+
+            # YouTube URL
+            youtube_match = YOUTUBE_PATTERN.search(candidate)
+            if youtube_match:
+                full_url = youtube_match.group(0)
+                video_id = youtube_match.group(1)
+                return ContentType.YOUTUBE, {"url": full_url, "video_id": video_id}
+
+            # AceStream ID (40-char hex, but not a magnet hash)
+            acestream_match = ACESTREAM_PATTERN.search(candidate)
+            if acestream_match and "magnet:" not in candidate.lower():
+                return ContentType.ACESTREAM, acestream_match.group(1)
+
+            # Generic HTTP URL (check last, after more specific patterns)
+            http_match = HTTP_URL_PATTERN.search(candidate)
+            if http_match:
+                url = http_match.group(0)
+                # Make sure it's not an already-matched pattern
+                if not any(
+                    [
+                        MAGNET_PATTERN.search(url),
+                        NZB_URL_PATTERN.search(url),
+                        YOUTUBE_PATTERN.search(url),
+                        TORRENT_URL_PATTERN.search(url),
+                    ]
+                ):
+                    return ContentType.HTTP, url
+
+        return None, None
+
+    def get_content_type_emoji(self, content_type: ContentType) -> str:
+        """Get emoji for content type."""
+        return {
+            ContentType.MAGNET: "🧲",
+            ContentType.TORRENT_FILE: "📦",
+            ContentType.TORRENT_URL: "🔗📦",
+            ContentType.NZB: "📰",
+            ContentType.YOUTUBE: "▶️",
+            ContentType.HTTP: "🔗",
+            ContentType.ACESTREAM: "📡",
+            ContentType.VIDEO: "🎬",
+        }.get(content_type, "📁")
+
+    def get_content_type_name(self, content_type: ContentType) -> str:
+        """Get display name for content type."""
+        return {
+            ContentType.MAGNET: "Magnet Link",
+            ContentType.TORRENT_FILE: "Torrent File",
+            ContentType.TORRENT_URL: "Torrent URL",
+            ContentType.NZB: "NZB URL",
+            ContentType.YOUTUBE: "YouTube Video",
+            ContentType.HTTP: "HTTP Link",
+            ContentType.ACESTREAM: "AceStream",
+            ContentType.VIDEO: "Video File",
+        }.get(content_type, "Content")
+
+    # ============================================
+    # Conversation State Management
+    # ============================================
+
+    def get_conversation(self, user_id: int) -> ConversationState | None:
+        """Get conversation state for a user.
+
+        Always reads from Redis so all workers see the latest state.
+        """
+        try:
+            redis_data = REDIS_SYNC_CLIENT.get(self._conversation_key(user_id))
+            if not redis_data:
+                return None
+            state = self._deserialize_state(redis_data)
+        except Exception as e:
+            logger.debug(f"Failed to load conversation from Redis for user {user_id}: {e}")
+            return None
+
+        if state and state.is_expired():
+            try:
+                REDIS_SYNC_CLIENT.delete(self._conversation_key(user_id))
+            except Exception:
+                pass
+            return None
+        return state
+
+    def create_conversation(
+        self,
+        user_id: int,
+        chat_id: int,
+        content_type: ContentType,
+        raw_input: Any,
+        message_id: int | None = None,
+    ) -> ConversationState:
+        """Create a new conversation state for a user."""
+        state = ConversationState(
+            user_id=user_id,
+            chat_id=chat_id,
+            content_type=content_type,
+            raw_input=raw_input,
+            original_message_id=message_id,
+            step=ConversationStep.AWAITING_MEDIA_TYPE,
+        )
+        self._persist_conversation(state)
+        return state
+
+    def clear_conversation(self, user_id: int):
+        """Clear conversation state for a user."""
+        try:
+            REDIS_SYNC_CLIENT.delete(self._conversation_key(user_id))
+        except Exception:
+            pass
+
+    # ============================================
+    # Authentication Check
+    # ============================================
+
+    async def check_user_linked(self, telegram_user_id: int) -> tuple[bool, int | None]:
+        """Check if a Telegram user is linked to a MediaFusion account.
+
+        Args:
+            telegram_user_id: Telegram user ID
+
+        Returns:
+            Tuple of (is_linked, mediafusion_user_id)
+        """
+        mf_user_id = await self._get_mediafusion_user_id(telegram_user_id)
+        return (mf_user_id is not None, mf_user_id)
+
+    # ============================================
+    # Contribution Wizard Flow Methods
+    # ============================================
+
+    async def start_contribution_flow(
+        self,
+        user_id: int,
+        chat_id: int,
+        content_type: ContentType,
+        raw_input: Any,
+        message_id: int | None = None,
+    ) -> dict:
+        """Start the contribution wizard flow.
+
+        This is the entry point for all content contributions.
+        It checks authentication and shows the media type selection.
+
+        Args:
+            user_id: Telegram user ID
+            chat_id: Chat ID
+            content_type: Detected content type
+            raw_input: Raw input data (URL, file info, etc.)
+            message_id: Original message ID
+
+        Returns:
+            Dict with result
+        """
+        # Check if user is linked
+        is_linked, _ = await self.check_user_linked(user_id)
+        if not is_linked:
+            return {
+                "success": False,
+                "message": (
+                    "🔐 *Account Required*\n\n"
+                    "To contribute content, you need to link your MediaFusion account.\n\n"
+                    "Send `/login` to get started."
+                ),
+                "requires_login": True,
+            }
+
+        # Create conversation state
+        state = self.create_conversation(user_id, chat_id, content_type, raw_input, message_id)
+
+        # Build media type selection message
+        emoji = self.get_content_type_emoji(content_type)
+        type_name = self.get_content_type_name(content_type)
+
+        # Get content preview text
+        preview = self._get_content_preview(content_type, raw_input)
+
+        message = f"{emoji} *{type_name} Detected*\n\n{preview}\n\nSelect the content type:"
+
+        keyboard = self._build_media_type_keyboard(user_id)
+
+        return {
+            "success": True,
+            "message": message,
+            "reply_markup": {"inline_keyboard": keyboard},
+            "state": state,
+        }
+
+    def _get_content_preview(self, content_type: ContentType, raw_input: Any) -> str:
+        """Get a preview string for the content."""
+        if content_type == ContentType.MAGNET:
+            # Extract info hash from magnet
+            info_hash, _ = torrent.parse_magnet(raw_input)
+            return f"*Info Hash:* `{info_hash[:16]}...`" if info_hash else "*Magnet Link*"
+        elif content_type == ContentType.VIDEO:
+            file_name = raw_input.get("file_name", "Unknown")
+            file_size = raw_input.get("file_size", 0)
+            size_mb = file_size // (1024 * 1024) if file_size else 0
+            return f"*File:* `{file_name}`\n*Size:* {size_mb} MB"
+        elif content_type == ContentType.TORRENT_FILE:
+            file_name = raw_input.get("file_name", "Unknown")
+            return f"*File:* `{file_name}`"
+        elif content_type == ContentType.YOUTUBE:
+            video_id = raw_input.get("video_id", "")
+            return f"*Video ID:* `{video_id}`"
+        elif content_type == ContentType.NZB:
+            return f"*URL:* `{raw_input[:50]}...`" if len(raw_input) > 50 else f"*URL:* `{raw_input}`"
+        elif content_type == ContentType.HTTP:
+            return f"*URL:* `{raw_input[:50]}...`" if len(raw_input) > 50 else f"*URL:* `{raw_input}`"
+        elif content_type == ContentType.ACESTREAM:
+            return f"*Content ID:* `{raw_input}`"
+        return "*Content received*"
+
+    def _build_media_type_keyboard(self, user_id: int) -> list[list[dict]]:
+        """Build the media type selection keyboard."""
+        return [
+            [
+                {"text": "🎬 Movie", "callback_data": f"mtype:{user_id}:movie"},
+                {"text": "📺 Series", "callback_data": f"mtype:{user_id}:series"},
+                {"text": "🏆 Sports", "callback_data": f"mtype:{user_id}:sports"},
+            ],
+            [{"text": "❌ Cancel", "callback_data": f"cancel:{user_id}"}],
+        ]
+
+    @staticmethod
+    def _collect_match_ids(match: dict) -> dict[str, str]:
+        """Extract canonical external IDs from a metadata match dict."""
+        ids: dict[str, str] = {}
+        external = match.get("external_ids") or {}
+
+        def _set_if(key: str, value: Any):
+            if value:
+                ids[key] = str(value)
+
+        _set_if("imdb", match.get("imdb_id"))
+        _set_if("tmdb", match.get("tmdb_id"))
+        _set_if("tvdb", match.get("tvdb_id"))
+        _set_if("mal", match.get("mal_id"))
+        _set_if("kitsu", match.get("kitsu_id"))
+
+        _set_if("imdb", external.get("imdb"))
+        _set_if("imdb", external.get("imdb_id"))
+        _set_if("tmdb", external.get("tmdb"))
+        _set_if("tmdb", external.get("tmdb_id"))
+        _set_if("tvdb", external.get("tvdb"))
+        _set_if("tvdb", external.get("tvdb_id"))
+        _set_if("mal", external.get("mal"))
+        _set_if("mal", external.get("mal_id"))
+        _set_if("kitsu", external.get("kitsu"))
+        _set_if("kitsu", external.get("kitsu_id"))
+        return ids
+
+    @staticmethod
+    def _get_canonical_external_id(match: dict) -> str | None:
+        """Get the best canonical external ID for a match in a format compatible
+        with ``get_media_by_external_id`` and ``fetch_and_create_media_from_external``.
+
+        Priority order: IMDb > TMDB > TVDB > MAL > Kitsu.
+        Returns prefixed strings like ``tt1234567``, ``tmdb:123``, ``tvdb:456``, etc.
+        Falls back to ``match["id"]`` if nothing better is available.
+        """
+        external = match.get("external_ids") or {}
+
+        # IMDb – already prefixed
+        imdb = match.get("imdb_id") or external.get("imdb") or external.get("imdb_id")
+        if imdb and str(imdb).startswith("tt"):
+            return str(imdb)
+
+        # TMDB
+        tmdb = match.get("tmdb_id") or external.get("tmdb") or external.get("tmdb_id")
+        if tmdb:
+            return f"tmdb:{tmdb}"
+
+        # TVDB
+        tvdb = match.get("tvdb_id") or external.get("tvdb") or external.get("tvdb_id")
+        if tvdb:
+            return f"tvdb:{tvdb}"
+
+        # MAL
+        mal = match.get("mal_id") or external.get("mal") or external.get("mal_id")
+        if mal:
+            return f"mal:{mal}"
+
+        # Kitsu
+        kitsu = match.get("kitsu_id") or external.get("kitsu") or external.get("kitsu_id")
+        if kitsu:
+            return f"kitsu:{kitsu}"
+
+        # Fallback to the generic "id" field (may already be prefixed)
+        fallback = match.get("id")
+        if fallback:
+            return str(fallback)
+
+        return None
+
+    async def _add_custom_poster(self, session, media_id: int, poster_url: str) -> None:
+        """Add a custom poster image provided by the user.
+
+        Args:
+            session: Database session
+            media_id: Media ID to add image for
+            poster_url: URL of the poster image
+        """
+        # Get or create the "mediafusion" provider for user-contributed images
+        provider = await session.exec(select(MetadataProvider).where(MetadataProvider.name == "mediafusion"))
+        provider = provider.first()
+        if not provider:
+            provider = MetadataProvider(name="mediafusion", display_name="MediaFusion")
+            session.add(provider)
+            await session.flush()
+
+        session.add(
+            MediaImage(
+                media_id=media_id,
+                provider_id=provider.id,
+                image_type="poster",
+                url=poster_url,
+                is_primary=True,
+                display_order=1,
+            )
+        )
+
+    async def _add_sports_images(
+        self, session, media_id: int, sports_category: str, custom_poster_url: str | None = None
+    ) -> None:
+        """Add poster and background images for sports content from SPORTS_ARTIFACTS.
+
+        Maps the internal sports_category to the display name used in SPORTS_ARTIFACTS,
+        then randomly selects poster and background images.
+
+        Args:
+            session: Database session
+            media_id: Media ID to add images for
+            sports_category: Sports category key (e.g. 'american_football')
+            custom_poster_url: Optional custom poster URL provided by user
+        """
+        # Map category to SPORTS_ARTIFACTS key
+        category_display_name = SPORTS_CATEGORIES.get(sports_category, "Sports")
+
+        # Try exact match first, then fallback to generic sports
+        artifacts = SPORTS_ARTIFACTS.get(category_display_name)
+        if not artifacts:
+            # Try some common variations
+            for key in SPORTS_ARTIFACTS:
+                if sports_category.replace("_", " ").lower() in key.lower():
+                    artifacts = SPORTS_ARTIFACTS[key]
+                    break
+
+        if not artifacts:
+            # Use generic sports artifacts if available
+            artifacts = SPORTS_ARTIFACTS.get("Sports", {})
+
+        # Get or create the "mediafusion" provider for user-contributed images
+        provider = await session.exec(select(MetadataProvider).where(MetadataProvider.name == "mediafusion"))
+        provider = provider.first()
+        if not provider:
+            provider = MetadataProvider(name="mediafusion", display_name="MediaFusion")
+            session.add(provider)
+            await session.flush()
+
+        # Add poster image (prefer custom poster if provided)
+        if custom_poster_url:
+            session.add(
+                MediaImage(
+                    media_id=media_id,
+                    provider_id=provider.id,
+                    image_type="poster",
+                    url=custom_poster_url,
+                    is_primary=True,
+                    display_order=1,
+                )
+            )
+        elif artifacts:
+            posters = artifacts.get("poster", [])
+            if posters:
+                poster_url = random.choice(posters)
+                session.add(
+                    MediaImage(
+                        media_id=media_id,
+                        provider_id=provider.id,
+                        image_type="poster",
+                        url=poster_url,
+                        is_primary=True,
+                        display_order=1,
+                    )
+                )
+
+        # Add background image from sports artifacts
+        if artifacts:
+            backgrounds = artifacts.get("background", [])
+            if backgrounds:
+                background_url = random.choice(backgrounds)
+                session.add(
+                    MediaImage(
+                        media_id=media_id,
+                        provider_id=provider.id,
+                        image_type="background",
+                        url=background_url,
+                        is_primary=True,
+                        display_order=1,
+                    )
+                )
+
+    async def _check_content_already_exists(self, state: ConversationState) -> tuple[bool, str]:
+        """Check whether analyzed content already exists in DB.
+
+        Returns:
+            (exists, human_readable_reason)
+        """
+        analysis = state.analysis_result or {}
+        content_type = state.content_type
+
+        async with get_async_session_context() as session:
+            if content_type in (ContentType.MAGNET, ContentType.TORRENT_FILE, ContentType.TORRENT_URL):
+                info_hash = analysis.get("info_hash")
+                if info_hash:
+                    normalized_hash = str(info_hash).strip().lower()
+                    existing = await session.exec(
+                        select(TorrentStream).where(func.lower(TorrentStream.info_hash) == normalized_hash)
+                    )
+                    if existing.first():
+                        return True, f"Torrent already exists (`{normalized_hash}`)"
+
+            elif content_type == ContentType.YOUTUBE:
+                video_id = analysis.get("video_id")
+                if video_id:
+                    existing = await session.exec(select(YouTubeStream).where(YouTubeStream.video_id == video_id))
+                    if existing.first():
+                        return True, f"YouTube video already exists (`{video_id}`)"
+
+            elif content_type == ContentType.HTTP:
+                url = analysis.get("url")
+                if url:
+                    existing = await session.exec(select(HTTPStream).where(HTTPStream.url == url))
+                    if existing.first():
+                        return True, "HTTP stream URL already exists"
+
+            elif content_type == ContentType.NZB:
+                nzb_url = analysis.get("nzb_url")
+                if nzb_url:
+                    nzb_guid = hashlib.sha256(nzb_url.encode()).hexdigest()[:32]
+                    existing = await session.exec(select(UsenetStream).where(UsenetStream.nzb_guid == nzb_guid))
+                    if existing.first():
+                        return True, f"NZB already exists (`{nzb_guid}`)"
+
+            elif content_type == ContentType.ACESTREAM:
+                content_id = analysis.get("content_id")
+                if content_id:
+                    existing = await session.exec(
+                        select(AceStreamStream).where(AceStreamStream.content_id == content_id)
+                    )
+                    if existing.first():
+                        return True, f"AceStream already exists (`{content_id}`)"
+
+            elif content_type == ContentType.VIDEO:
+                file_unique_id = analysis.get("file_unique_id")
+                if file_unique_id:
+                    existing = await session.exec(
+                        select(TelegramStream).where(TelegramStream.file_unique_id == file_unique_id)
+                    )
+                    if existing.first():
+                        return True, "Telegram file already exists (same file_unique_id)"
+
+        return False, ""
+
+    async def handle_media_type_selection(self, user_id: int, chat_id: int, message_id: int, media_type: str) -> dict:
+        """Handle media type selection and run analysis.
+
+        Args:
+            user_id: Telegram user ID
+            chat_id: Chat ID
+            message_id: Message ID to edit
+            media_type: Selected media type (movie, series, sports)
+
+        Returns:
+            Dict with result
+        """
+        state = self.get_conversation(user_id)
+        if not state:
+            return {"success": False, "message": "Session expired. Please start over."}
+
+        state.media_type = media_type
+        state.message_id = message_id
+        state.step = ConversationStep.ANALYZING
+        state.touch()
+        self._persist_conversation(state)
+
+        # Show analyzing message
+        emoji = self.get_content_type_emoji(state.content_type)
+        await self.edit_message(
+            chat_id,
+            message_id,
+            f"{emoji} *Analyzing content...*\n\n⏳ Please wait...",
+        )
+
+        # Run analysis
+        try:
+            analysis_result = await self.run_analysis(state)
+
+            if not analysis_result.get("success"):
+                state.step = ConversationStep.IDLE
+                error_msg = analysis_result.get("error", "Unknown error")
+                # Show error to user
+                await self.edit_message(
+                    chat_id,
+                    message_id,
+                    f"❌ *Analysis Failed*\n\n{error_msg}\n\n_Please try again with different content._",
+                )
+                self.clear_conversation(user_id)
+                return {"success": False, "message": error_msg}
+
+            state.analysis_result = analysis_result
+            state.matches = analysis_result.get("matches", [])
+
+            # Early duplicate check: stop here if already in DB
+            exists, reason = await self._check_content_already_exists(state)
+            if exists:
+                await self.edit_message(
+                    chat_id,
+                    message_id,
+                    f"ℹ️ *Already Available*\n\n{reason}\n\nThis content is already in MediaFusion, so import is skipped.",
+                )
+                self.clear_conversation(user_id)
+                return {"success": True, "message": "Already exists"}
+
+            # For sports: skip match selection and show sports category picker
+            if media_type == "sports":
+                return await self.show_sports_category_picker(state, chat_id, message_id)
+
+            # Show matches for movie/series
+            return await self.show_matches(state, chat_id, message_id)
+
+        except Exception as e:
+            logger.exception(f"Error during analysis: {e}")
+            state.step = ConversationStep.IDLE
+            # Show error to user
+            await self.edit_message(
+                chat_id,
+                message_id,
+                f"❌ *Analysis Error*\n\n{str(e)}\n\n_Please try again._",
+            )
+            self.clear_conversation(user_id)
+            return {"success": False, "message": str(e)}
+
+    async def run_analysis(self, state: ConversationState) -> dict:
+        """Run content analysis based on content type.
+
+        This calls the appropriate analyze function from the import modules.
+
+        Args:
+            state: Conversation state
+
+        Returns:
+            Analysis result dict
+        """
+        content_type = state.content_type
+        raw_input = state.raw_input
+        media_type = state.media_type
+
+        try:
+            if content_type == ContentType.MAGNET:
+                return await self._analyze_magnet(raw_input, media_type)
+            elif content_type == ContentType.TORRENT_FILE:
+                return await self._analyze_torrent_file(raw_input, media_type)
+            elif content_type == ContentType.TORRENT_URL:
+                return await self._analyze_torrent_url(raw_input, media_type)
+            elif content_type == ContentType.VIDEO:
+                return await self._analyze_video(raw_input, media_type)
+            elif content_type == ContentType.YOUTUBE:
+                return await self._analyze_youtube(raw_input, media_type)
+            elif content_type == ContentType.HTTP:
+                return await self._analyze_http(raw_input, media_type)
+            elif content_type == ContentType.NZB:
+                return await self._analyze_nzb(raw_input, media_type)
+            elif content_type == ContentType.ACESTREAM:
+                return await self._analyze_acestream(raw_input, media_type)
+            else:
+                return {"success": False, "error": f"Unsupported content type: {content_type}"}
+        except Exception as e:
+            logger.exception(f"Analysis error for {content_type}: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def _analyze_magnet(self, magnet_link: str, media_type: str) -> dict:
+        """Analyze a magnet link."""
+        info_hash, trackers = torrent.parse_magnet(magnet_link)
+        if not info_hash:
+            return {"success": False, "error": "Invalid magnet link format."}
+
+        try:
+            # Fetch torrent metadata from DHT
+            torrent_data_list = await torrent.info_hashes_to_torrent_metadata(
+                [info_hash], trackers, is_raise_error=True
+            )
+
+            if not torrent_data_list or not torrent_data_list[0]:
+                return {"success": False, "error": "Failed to fetch torrent metadata from DHT network."}
+
+            torrent_data = torrent_data_list[0]
+
+            # Search for matches
+            matches = []
+            if torrent_data.get("title"):
+                try:
+                    matches = await meta_fetcher.search_multiple_results(
+                        title=torrent_data["title"],
+                        year=torrent_data.get("year"),
+                        media_type=media_type,
+                    )
+                except Exception:
+                    pass
+
+            total_size = torrent_data.get("total_size", 0)
+            return {
+                "success": True,
+                "info_hash": info_hash.lower(),
+                "torrent_name": torrent_data.get("torrent_name"),
+                "total_size": total_size,
+                "total_size_readable": convert_bytes_to_readable(total_size) if total_size else "Unknown",
+                "file_count": len(torrent_data.get("file_data", [])),
+                "files": torrent_data.get("file_data", []),
+                "parsed_title": torrent_data.get("title"),
+                "year": torrent_data.get("year"),
+                "resolution": torrent_data.get("resolution"),
+                "quality": torrent_data.get("quality"),
+                "codec": torrent_data.get("codec"),
+                "audio": torrent_data.get("audio"),
+                "matches": matches,
+            }
+
+        except Exception as e:
+            return {"success": False, "error": f"DHT lookup failed: {str(e)}"}
+
+    async def _analyze_torrent_file(self, file_info: dict, media_type: str) -> dict:
+        """Analyze a torrent file by downloading and parsing it."""
+        file_id = file_info.get("file_id")
+        if not file_id:
+            return {"success": False, "error": "No file ID provided."}
+
+        # Download the torrent file
+        try:
+            file_data = await self.get_file_info(file_id)
+            if not file_data:
+                return {"success": False, "error": "Failed to get file info from Telegram."}
+
+            file_path = file_data.get("file_path")
+            if not file_path:
+                return {"success": False, "error": "No file path in response."}
+
+            # Download the file content
+            async with aiohttp.ClientSession() as session:
+                download_url = f"https://api.telegram.org/file/bot{self.bot_token}/{file_path}"
+                async with session.get(download_url) as response:
+                    if response.status != 200:
+                        return {"success": False, "error": "Failed to download torrent file."}
+                    torrent_content = await response.read()
+
+            # Parse the torrent
+            torrent_data = torrent.extract_torrent_metadata(torrent_content, is_raise_error=True)
+            if not torrent_data:
+                return {"success": False, "error": "Failed to parse torrent file."}
+
+            # Store the torrent content for later import
+            file_info["torrent_content"] = torrent_content
+
+            # Search for matches
+            matches = []
+            if torrent_data.get("title"):
+                try:
+                    matches = await meta_fetcher.search_multiple_results(
+                        title=torrent_data["title"],
+                        year=torrent_data.get("year"),
+                        media_type=media_type,
+                    )
+                except Exception:
+                    pass
+
+            total_size = torrent_data.get("total_size", 0)
+            return {
+                "success": True,
+                "info_hash": torrent_data.get("info_hash", "").lower(),
+                "torrent_name": torrent_data.get("torrent_name"),
+                "total_size": total_size,
+                "total_size_readable": convert_bytes_to_readable(total_size) if total_size else "Unknown",
+                "file_count": len(torrent_data.get("file_data", [])),
+                "files": torrent_data.get("file_data", []),
+                "parsed_title": torrent_data.get("title"),
+                "year": torrent_data.get("year"),
+                "resolution": torrent_data.get("resolution"),
+                "quality": torrent_data.get("quality"),
+                "codec": torrent_data.get("codec"),
+                "audio": torrent_data.get("audio"),
+                "matches": matches,
+            }
+
+        except Exception as e:
+            return {"success": False, "error": f"Torrent analysis failed: {str(e)}"}
+
+    async def _analyze_torrent_url(self, torrent_url: str, media_type: str) -> dict:
+        """Analyze a torrent file URL by fetching and parsing it.
+
+        This handles URLs that return torrent file content directly, such as:
+        - https://example.com/download.torrent
+        - https://tracker.example.com/torrents/12345/download
+        """
+        try:
+            # Fetch the torrent file from URL
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    torrent_url,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                ) as response:
+                    if response.status != 200:
+                        return {
+                            "success": False,
+                            "error": f"Failed to fetch torrent file (HTTP {response.status}).",
+                        }
+
+                    # Note: content_type not used currently, but could be validated
+                    torrent_content = await response.read()
+
+                    # Validate it looks like a torrent file
+                    # Torrent files are bencoded and typically start with 'd' (dict)
+                    if not torrent_content or torrent_content[0:1] != b"d":
+                        # Check if it's HTML (error page)
+                        if b"<html" in torrent_content[:100].lower() or b"<!doctype" in torrent_content[:100].lower():
+                            return {
+                                "success": False,
+                                "error": "URL returned HTML instead of torrent file. The link may require authentication.",
+                            }
+                        return {
+                            "success": False,
+                            "error": "URL did not return valid torrent file content.",
+                        }
+
+            # Parse the torrent
+            torrent_data = torrent.extract_torrent_metadata(torrent_content, is_raise_error=True)
+            if not torrent_data:
+                return {"success": False, "error": "Failed to parse torrent file content."}
+
+            # Search for matches
+            matches = []
+            if torrent_data.get("title"):
+                try:
+                    matches = await meta_fetcher.search_multiple_results(
+                        title=torrent_data["title"],
+                        year=torrent_data.get("year"),
+                        media_type=media_type,
+                    )
+                except Exception:
+                    pass
+
+            total_size = torrent_data.get("total_size", 0)
+            return {
+                "success": True,
+                "info_hash": torrent_data.get("info_hash", "").lower(),
+                "torrent_name": torrent_data.get("torrent_name"),
+                "total_size": total_size,
+                "total_size_readable": convert_bytes_to_readable(total_size) if total_size else "Unknown",
+                "file_count": len(torrent_data.get("file_data", [])),
+                "files": torrent_data.get("file_data", []),
+                "parsed_title": torrent_data.get("title"),
+                "year": torrent_data.get("year"),
+                "resolution": torrent_data.get("resolution"),
+                "quality": torrent_data.get("quality"),
+                "codec": torrent_data.get("codec"),
+                "audio": torrent_data.get("audio"),
+                "matches": matches,
+                "torrent_content": torrent_content,  # Store for import
+                "source_url": torrent_url,
+            }
+
+        except aiohttp.ClientError as e:
+            return {"success": False, "error": f"Network error fetching torrent: {str(e)}"}
+        except Exception as e:
+            return {"success": False, "error": f"Torrent URL analysis failed: {str(e)}"}
+
+    async def _analyze_video(self, video_info: dict, media_type: str) -> dict:
+        """Analyze a video file using filename parsing."""
+        file_name = video_info.get("file_name") or "unknown_video"
+        file_size = video_info.get("file_size", 0)
+
+        # Validate file size
+        min_size = settings.min_scraping_video_size
+        if file_size and file_size < min_size:
+            return {
+                "success": False,
+                "error": f"File too small (minimum {min_size // (1024 * 1024)} MB required).",
+            }
+
+        # Parse filename
+        parsed = {}
+        search_title = None
+        search_year = None
+
+        try:
+            parsed = PTT.parse_title(file_name, True)
+            search_title = parsed.get("title")
+            search_year = parsed.get("year")
+        except Exception as e:
+            logger.debug(f"PTT parsing error: {e}")
+
+        # Search for matches
+        matches = []
+        if search_title:
+            try:
+                matches = await search_multiple_imdb(
+                    title=search_title,
+                    limit=5,
+                    year=search_year,
+                    media_type=media_type,
+                    min_similarity=60,
+                )
+            except Exception:
+                pass
+
+        return {
+            "success": True,
+            "file_name": file_name,
+            "file_id": video_info.get("file_id"),
+            "file_unique_id": video_info.get("file_unique_id"),
+            "file_size": file_size,
+            "file_size_readable": convert_bytes_to_readable(file_size) if file_size else "Unknown",
+            "mime_type": video_info.get("mime_type"),
+            "parsed_title": search_title,
+            "year": search_year,
+            "resolution": parsed.get("resolution"),
+            "quality": parsed.get("quality"),
+            "codec": parsed.get("codec"),
+            "audio": parsed.get("audio"),
+            "languages": parsed.get("languages"),
+            "seasons": parsed.get("seasons"),
+            "episodes": parsed.get("episodes"),
+            "matches": matches,
+        }
+
+    async def _analyze_youtube(self, url_info: dict, media_type: str) -> dict:
+        """Analyze a YouTube URL using the shared youtube module."""
+        video_id = url_info.get("video_id")
+        url = url_info.get("url")
+
+        if not video_id:
+            return {"success": False, "error": "Invalid YouTube URL."}
+
+        try:
+            # Use shared youtube module for metadata extraction
+            video_info = await analyze_youtube_video(video_id)
+
+            title = video_info.title
+            duration = video_info.duration
+            channel = video_info.channel or ""
+            is_live = video_info.is_live
+
+            # Search for matches
+            matches = []
+            if title:
+                try:
+                    matches = await meta_fetcher.search_multiple_results(
+                        title=title,
+                        media_type=media_type,
+                    )
+                except Exception:
+                    pass
+
+            return {
+                "success": True,
+                "video_id": video_id,
+                "url": url,
+                "title": title,
+                "duration": duration,
+                "channel": channel,
+                "is_live": is_live,
+                "parsed_title": title,
+                "matches": matches,
+                "thumbnail": video_info.thumbnail,
+                "resolution": video_info.resolution,
+            }
+
+        except Exception as e:
+            return {"success": False, "error": f"YouTube analysis failed: {str(e)}"}
+
+    async def _analyze_http(self, url: str, media_type: str) -> dict:
+        """Analyze an HTTP direct link."""
+        try:
+            # Parse URL to get filename
+            parsed_url = urlparse(url)
+            path = unquote(parsed_url.path)
+            file_name = os.path.basename(path) or "unknown"
+
+            # Try to get content info via HEAD request
+            content_length = None
+            content_type = None
+
+            async with aiohttp.ClientSession() as session:
+                try:
+                    async with session.head(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                        content_length = response.headers.get("Content-Length")
+                        content_type = response.headers.get("Content-Type", "")
+                except Exception:
+                    pass
+
+            # Parse filename for metadata
+            parsed = {}
+            search_title = None
+            try:
+                parsed = PTT.parse_title(file_name, True)
+                search_title = parsed.get("title")
+            except Exception:
+                search_title = file_name
+
+            # Search for matches
+            matches = []
+            if search_title:
+                try:
+                    matches = await meta_fetcher.search_multiple_results(
+                        title=search_title,
+                        year=parsed.get("year"),
+                        media_type=media_type,
+                    )
+                except Exception:
+                    pass
+
+            size = int(content_length) if content_length else None
+            return {
+                "success": True,
+                "url": url,
+                "file_name": file_name,
+                "content_type": content_type,
+                "file_size": size,
+                "file_size_readable": convert_bytes_to_readable(size) if size else "Unknown",
+                "parsed_title": search_title,
+                "year": parsed.get("year"),
+                "resolution": parsed.get("resolution"),
+                "quality": parsed.get("quality"),
+                "codec": parsed.get("codec"),
+                "matches": matches,
+            }
+
+        except Exception as e:
+            return {"success": False, "error": f"HTTP analysis failed: {str(e)}"}
+
+    async def _analyze_nzb(self, nzb_url: str, media_type: str) -> dict:
+        """Analyze an NZB URL."""
+        try:
+            # Parse URL to get filename
+            parsed_url = urlparse(nzb_url)
+            path = unquote(parsed_url.path)
+            file_name = os.path.basename(path) or "unknown.nzb"
+            nzb_name = file_name.replace(".nzb", "")
+
+            # Parse filename for metadata
+            parsed = {}
+            search_title = None
+            try:
+                parsed = PTT.parse_title(nzb_name, True)
+                search_title = parsed.get("title")
+            except Exception:
+                search_title = nzb_name
+
+            # Search for matches
+            matches = []
+            if search_title:
+                try:
+                    matches = await meta_fetcher.search_multiple_results(
+                        title=search_title,
+                        year=parsed.get("year"),
+                        media_type=media_type,
+                    )
+                except Exception:
+                    pass
+
+            return {
+                "success": True,
+                "nzb_url": nzb_url,
+                "nzb_name": nzb_name,
+                "parsed_title": search_title,
+                "year": parsed.get("year"),
+                "resolution": parsed.get("resolution"),
+                "quality": parsed.get("quality"),
+                "codec": parsed.get("codec"),
+                "matches": matches,
+            }
+
+        except Exception as e:
+            return {"success": False, "error": f"NZB analysis failed: {str(e)}"}
+
+    async def _analyze_acestream(self, content_id: str, _media_type: str) -> dict:
+        """Analyze an AceStream content ID."""
+        # AceStream doesn't provide much metadata, so we just validate the ID
+        if not content_id or len(content_id) != 40:
+            return {"success": False, "error": "Invalid AceStream content ID (must be 40 hex characters)."}
+
+        # Try to verify it's valid hex
+        try:
+            int(content_id, 16)
+        except ValueError:
+            return {"success": False, "error": "Invalid AceStream content ID (not valid hex)."}
+
+        return {
+            "success": True,
+            "content_id": content_id.lower(),
+            "parsed_title": None,
+            "matches": [],  # No matches without metadata
+        }
+
+    async def show_matches(self, state: ConversationState, chat_id: int, message_id: int) -> dict:
+        """Show match selection keyboard after analysis.
+
+        Args:
+            state: Conversation state
+            chat_id: Chat ID
+            message_id: Message ID to edit
+
+        Returns:
+            Dict with result
+        """
+        state.step = ConversationStep.AWAITING_MATCH
+        state.touch()
+        self._persist_conversation(state)
+
+        analysis = state.analysis_result
+        matches = state.matches or []
+
+        # Build analysis summary
+        summary_parts = []
+        if analysis.get("torrent_name"):
+            summary_parts.append(f"*Name:* `{analysis['torrent_name'][:60]}`")
+        elif analysis.get("file_name"):
+            summary_parts.append(f"*File:* `{analysis['file_name'][:60]}`")
+        elif analysis.get("nzb_name"):
+            summary_parts.append(f"*NZB:* `{analysis['nzb_name'][:60]}`")
+        elif analysis.get("title"):
+            summary_parts.append(f"*Title:* {analysis['title'][:60]}")
+
+        if analysis.get("total_size_readable"):
+            summary_parts.append(f"*Size:* {analysis['total_size_readable']}")
+        elif analysis.get("file_size_readable"):
+            summary_parts.append(f"*Size:* {analysis['file_size_readable']}")
+
+        if analysis.get("file_count") and analysis["file_count"] > 1:
+            summary_parts.append(f"*Files:* {analysis['file_count']}")
+
+        # Show parsed metadata
+        meta_parts = []
+        if analysis.get("resolution"):
+            meta_parts.append(analysis["resolution"])
+        if analysis.get("quality"):
+            meta_parts.append(analysis["quality"])
+        if analysis.get("codec"):
+            meta_parts.append(analysis["codec"])
+        if meta_parts:
+            summary_parts.append(f"*Quality:* {' | '.join(meta_parts)}")
+
+        summary = "\n".join(summary_parts) if summary_parts else "*Content analyzed*"
+
+        # Build keyboard
+        keyboard = []
+        match_details = []
+        if matches:
+            for idx, match in enumerate(matches[:5], 1):
+                canonical_id = self._get_canonical_external_id(match) or ""
+                title = match.get("title", "Unknown")
+                year = match.get("year", "")
+                match_type = match.get("type", "movie")
+                type_emoji = "🎬" if match_type == "movie" else "📺"
+                ids = self._collect_match_ids(match)
+                id_parts = []
+                if ids.get("imdb"):
+                    id_parts.append(f"IMDb `{ids['imdb']}`")
+                if ids.get("tmdb"):
+                    id_parts.append(f"TMDB `{ids['tmdb']}`")
+                if ids.get("tvdb"):
+                    id_parts.append(f"TVDB `{ids['tvdb']}`")
+                if ids.get("mal"):
+                    id_parts.append(f"MAL `{ids['mal']}`")
+                if ids.get("kitsu"):
+                    id_parts.append(f"Kitsu `{ids['kitsu']}`")
+
+                # Show the most recognizable ID in the button text
+                short_id = ""
+                if ids.get("imdb"):
+                    short_id = ids["imdb"]
+                elif ids.get("tmdb"):
+                    short_id = f"tmdb:{ids['tmdb']}"
+                elif ids.get("tvdb"):
+                    short_id = f"tvdb:{ids['tvdb']}"
+                elif ids.get("mal"):
+                    short_id = f"mal:{ids['mal']}"
+                elif ids.get("kitsu"):
+                    short_id = f"kitsu:{ids['kitsu']}"
+
+                button_text = f"{idx}. {type_emoji} {title}"
+                if year:
+                    button_text += f" ({year})"
+                if short_id:
+                    button_text += f" [{short_id}]"
+                if len(button_text) > 60:
+                    button_text = button_text[:57] + "..."
+
+                keyboard.append(
+                    [
+                        {
+                            "text": button_text,
+                            "callback_data": f"match:{state.user_id}:{canonical_id}",
+                        }
+                    ]
+                )
+                if id_parts:
+                    match_details.append(f"{idx}. {title} ({year or 'N/A'}) — " + " | ".join(id_parts))
+                else:
+                    match_details.append(f"{idx}. {title} ({year or 'N/A'})")
+
+        # Add search by title, manual entry, and cancel
+        keyboard.append([{"text": "🔍 Search by title", "callback_data": f"search_title:{state.user_id}"}])
+        keyboard.append([{"text": "📝 Enter external ID manually", "callback_data": f"manual:{state.user_id}"}])
+        if state.batch_item_id:
+            keyboard.append([{"text": "← Back to batch", "callback_data": f"batch:summary:{state.user_id}"}])
+        keyboard.append([{"text": "❌ Cancel", "callback_data": f"cancel:{state.user_id}"}])
+
+        if matches:
+            details_block = "\n".join(match_details) if match_details else ""
+            message = (
+                f"✅ *Analysis Complete*\n\n{summary}\n\n"
+                f"🔍 *Found {len(matches)} match(es):*\n"
+                f"{details_block}\n\n"
+                f"Select a match:"
+            )
+        else:
+            message = f"✅ *Analysis Complete*\n\n{summary}\n\n❌ No automatic matches found.\n\nEnter an external ID manually:"
+
+        await self.edit_message(chat_id, message_id, message, {"inline_keyboard": keyboard})
+
+        return {"success": True, "matches_count": len(matches)}
+
+    # ============================================
+    # Sports Category Flow
+    # ============================================
+
+    async def show_sports_category_picker(self, state: ConversationState, chat_id: int, message_id: int) -> dict:
+        """Show sports category selection after analysis (for sports media type).
+
+        Auto-detects the sports category from the content title and shows
+        a confirmation option. User can confirm the detected category or
+        select a different one.
+
+        Args:
+            state: Conversation state
+            chat_id: Chat ID
+            message_id: Message ID to edit
+
+        Returns:
+            Dict with result
+        """
+        state.step = ConversationStep.AWAITING_SPORTS_CATEGORY
+        state.touch()
+        self._persist_conversation(state)
+
+        analysis = state.analysis_result or {}
+
+        # Get the title for category detection
+        name = analysis.get("torrent_name") or analysis.get("file_name") or analysis.get("title") or ""
+        parsed_title = analysis.get("parsed_title") or name
+
+        # Try to auto-detect the sports category
+        detected_category = detect_sports_category(parsed_title) or detect_sports_category(name)
+
+        # Build summary
+        summary_parts = []
+        if name:
+            summary_parts.append(f"*Name:* `{name[:80]}`")
+        if analysis.get("total_size_readable"):
+            summary_parts.append(f"*Size:* {analysis['total_size_readable']}")
+        elif analysis.get("file_size_readable"):
+            summary_parts.append(f"*Size:* {analysis['file_size_readable']}")
+        summary = "\n".join(summary_parts) if summary_parts else "*Content analyzed*"
+
+        # Build keyboard based on whether we detected a category
+        keyboard_rows = []
+
+        if detected_category:
+            # Show detected category with confirm button at top
+            detected_label = SPORTS_CATEGORIES.get(detected_category, "Sports")
+            keyboard_rows.append(
+                [
+                    {
+                        "text": f"✅ Confirm: {detected_label}",
+                        "callback_data": f"sport:{state.user_id}:{detected_category}",
+                    }
+                ]
+            )
+
+            # Add separator row with "Or select different:" label as a non-clickable display
+            # Since Telegram doesn't support non-clickable buttons, we'll just list other categories
+
+            # Build sports category keyboard (2 per row), excluding the detected one
+            items = [(k, v) for k, v in SPORTS_CATEGORIES.items() if k != detected_category]
+            for i in range(0, len(items), 2):
+                row = []
+                for key, label in items[i : i + 2]:
+                    row.append({"text": f"🏆 {label}", "callback_data": f"sport:{state.user_id}:{key}"})
+                keyboard_rows.append(row)
+
+            message = (
+                f"✅ *Analysis Complete*\n\n{summary}\n\n"
+                f"🏆 *Detected Category:* {detected_label}\n\n"
+                f"_Confirm the detected category or select a different one:_"
+            )
+        else:
+            # No detection - show all categories as before
+            items = list(SPORTS_CATEGORIES.items())
+            for i in range(0, len(items), 2):
+                row = []
+                for key, label in items[i : i + 2]:
+                    row.append({"text": f"🏆 {label}", "callback_data": f"sport:{state.user_id}:{key}"})
+                keyboard_rows.append(row)
+
+            message = f"✅ *Analysis Complete*\n\n{summary}\n\n🏆 *Select the sport category:*"
+
+        keyboard_rows.append(
+            [
+                {"text": "⬅️ Back", "callback_data": f"back:{state.user_id}"},
+                {"text": "❌ Cancel", "callback_data": f"cancel:{state.user_id}"},
+            ]
+        )
+
+        await self.edit_message(chat_id, message_id, message, {"inline_keyboard": keyboard_rows})
+        return {"success": True, "detected_category": detected_category}
+
+    async def handle_sports_category_selection(
+        self, user_id: int, chat_id: int, message_id: int, category_key: str
+    ) -> dict:
+        """Handle sports category selection and show metadata review.
+
+        For sports, external ID is optional. The bot creates a media record
+        using the event title from analysis and the selected sport catalog.
+
+        Args:
+            user_id: Telegram user ID
+            chat_id: Chat ID
+            message_id: Message ID to edit
+            category_key: Sports category key (e.g. 'football', 'basketball')
+
+        Returns:
+            Dict with result
+        """
+        state = self.get_conversation(user_id)
+        if not state:
+            await self.edit_message(
+                chat_id, message_id, "❌ *Session Expired*\n\nPlease start over by sending your content again."
+            )
+            return {"success": False, "message": "Session expired."}
+
+        category_label = SPORTS_CATEGORIES.get(category_key, "Other Sports")
+        state.sports_category = category_key
+
+        # Build a selected_match from the analysis for sports
+        # External ID is intentionally left empty — sports content doesn't always have one
+        analysis = state.analysis_result or {}
+
+        # Get the raw title for sports parsing
+        raw_title = analysis.get("torrent_name") or analysis.get("file_name") or analysis.get("title") or ""
+
+        # Use the sports parser to properly clean the title
+        # (PTT doesn't handle sports content well)
+        parsed = parse_sports_title(raw_title, category=category_key)
+        event_title = parsed.title if parsed.title else "Sports Event"
+
+        # Extract year from parsed date or fallback to analysis
+        year = parsed.year or analysis.get("year")
+
+        state.selected_match = {
+            "title": event_title,
+            "year": year,
+            "type": "movie",  # Sports VOD content is stored as movie (events type is for live content only)
+            "sports_category": category_key,
+            "sports_category_label": category_label,
+        }
+
+        state.step = ConversationStep.AWAITING_METADATA_REVIEW
+        state.touch()
+        self._persist_conversation(state)
+
+        return await self.show_metadata_review(state, chat_id, message_id)
+
+    # ============================================
+    # Match Selection (movie / series)
+    # ============================================
+
+    async def handle_match_selection(self, user_id: int, chat_id: int, message_id: int, external_id: str) -> dict:
+        """Handle match selection and show metadata review.
+
+        Args:
+            user_id: Telegram user ID
+            chat_id: Chat ID
+            message_id: Message ID to edit
+            external_id: Selected external ID (e.g. tt1234567, tmdb:123, tvdb:456)
+
+        Returns:
+            Dict with result
+        """
+        state = self.get_conversation(user_id)
+        if not state:
+            await self.edit_message(
+                chat_id, message_id, "❌ *Session Expired*\n\nPlease start over by sending your content again."
+            )
+            return {"success": False, "message": "Session expired. Please start over."}
+
+        # Find the selected match by comparing canonical IDs
+        selected_match = None
+        for match in state.matches or []:
+            canonical = self._get_canonical_external_id(match) or ""
+            if canonical == external_id:
+                selected_match = match
+                break
+
+        if not selected_match:
+            # Create a basic match from the provided external ID
+            selected_match = {"id": external_id, "title": external_id, "year": None}
+            # Populate the appropriate ID field based on prefix
+            if external_id.startswith("tt"):
+                selected_match["imdb_id"] = external_id
+            elif ":" in external_id:
+                provider, pid = external_id.split(":", 1)
+                selected_match[f"{provider}_id"] = pid
+
+        state.selected_match = selected_match
+        state.step = ConversationStep.AWAITING_METADATA_REVIEW
+        state.touch()
+        self._persist_conversation(state)
+
+        return await self.show_metadata_review(state, chat_id, message_id)
+
+    async def handle_manual_imdb_input(self, user_id: int, chat_id: int, message_id: int) -> dict:
+        """Show manual external ID input prompt.
+
+        Args:
+            user_id: Telegram user ID
+            chat_id: Chat ID
+            message_id: Message ID to edit
+
+        Returns:
+            Dict with result
+        """
+        state = self.get_conversation(user_id)
+        if not state:
+            return {"success": False, "message": "Session expired. Please start over."}
+
+        state.step = ConversationStep.AWAITING_MANUAL_IMDB
+        state.touch()
+        self._persist_conversation(state)
+
+        message = (
+            "📝 *Enter External ID*\n\n"
+            "Please reply with the external ID for this content.\n\n"
+            "*Supported formats:*\n"
+            "• IMDb: `tt1234567`\n"
+            "• TMDB: `tmdb:12345`\n"
+            "• TVDB: `tvdb:12345`\n"
+            "• MAL: `mal:12345`\n"
+            "• Kitsu: `kitsu:12345`\n\n"
+            "You can find these IDs on the respective metadata provider websites."
+        )
+
+        keyboard = [[{"text": "❌ Cancel", "callback_data": f"cancel:{user_id}"}]]
+
+        await self.edit_message(chat_id, message_id, message, {"inline_keyboard": keyboard})
+
+        return {"success": True, "awaiting_input": True}
+
+    async def process_manual_imdb_input(self, user_id: int, chat_id: int, text: str) -> dict:
+        """Process manually entered external ID (IMDb, TMDB, TVDB, MAL, Kitsu).
+
+        Args:
+            user_id: Telegram user ID
+            chat_id: Chat ID
+            text: User's text input
+
+        Returns:
+            Dict with result
+        """
+        state = self.get_conversation(user_id)
+        if not state or state.step != ConversationStep.AWAITING_MANUAL_IMDB:
+            return {"success": False, "handled": False}
+
+        # Try to extract any supported external ID format
+        ext_match = EXTERNAL_ID_PATTERN.search(text)
+        if not ext_match:
+            return {
+                "success": False,
+                "handled": True,
+                "message": (
+                    "❌ Invalid external ID format.\n\n"
+                    "*Supported formats:*\n"
+                    "• IMDb: `tt1234567`\n"
+                    "• TMDB: `tmdb:12345`\n"
+                    "• TVDB: `tvdb:12345`\n"
+                    "• MAL: `mal:12345`\n"
+                    "• Kitsu: `kitsu:12345`"
+                ),
+            }
+
+        external_id = ext_match.group(0)
+
+        # Build the selected_match based on the ID type
+        selected_match: dict[str, Any] = {"id": external_id, "title": external_id, "year": None}
+
+        if external_id.startswith("tt"):
+            selected_match["imdb_id"] = external_id
+            # Try to fetch metadata from IMDb
+            try:
+                metadata = await get_imdb_title_data(external_id, state.media_type or "movie")
+                if metadata:
+                    selected_match["title"] = metadata.get("title", external_id)
+                    selected_match["year"] = metadata.get("year")
+                    selected_match["type"] = metadata.get("type", "movie")
+            except Exception:
+                pass
+        elif ":" in external_id:
+            provider, pid = external_id.split(":", 1)
+            selected_match[f"{provider}_id"] = pid
+            # Try to fetch metadata from the provider
+            try:
+                metadata = await meta_fetcher.get_metadata_from_provider(provider, pid, state.media_type or "movie")
+                if metadata:
+                    selected_match["title"] = metadata.get("title", external_id)
+                    selected_match["year"] = metadata.get("year")
+                    selected_match["type"] = metadata.get("type", "movie")
+                    # Also copy over any external IDs from the fetched metadata
+                    if metadata.get("imdb_id"):
+                        selected_match["imdb_id"] = metadata["imdb_id"]
+                    if metadata.get("tmdb_id"):
+                        selected_match["tmdb_id"] = metadata["tmdb_id"]
+                    if metadata.get("external_ids"):
+                        selected_match["external_ids"] = metadata["external_ids"]
+            except Exception:
+                pass
+
+        state.selected_match = selected_match
+        state.step = ConversationStep.AWAITING_METADATA_REVIEW
+        state.touch()
+        self._persist_conversation(state)
+
+        # Send metadata review (as new message since we're responding to user's text)
+        result = await self.show_metadata_review(state, chat_id, None)
+        return {
+            "success": True,
+            "handled": True,
+            "message": result.get("message"),
+            "reply_markup": result.get("reply_markup"),
+        }
+
+    async def handle_title_search_prompt(self, user_id: int, chat_id: int, message_id: int) -> dict:
+        """Show title search prompt, asking the user to type a title to search."""
+        state = self.get_conversation(user_id)
+        if not state:
+            return {"success": False, "message": "No active session found."}
+
+        state.step = ConversationStep.AWAITING_TITLE_SEARCH
+        state.touch()
+        self._persist_conversation(state)
+
+        message = (
+            "🔍 *Search by Title*\n\n"
+            "Type the title of the movie or series you want to find.\n\n"
+            "*Examples:*\n"
+            "• `The Dark Knight`\n"
+            "• `Breaking Bad`\n"
+            "• `Inception 2010`"
+        )
+
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": "❌ Cancel", "callback_data": f"cancel:{user_id}"}],
+            ]
+        }
+        await self.edit_message(chat_id, message_id, message, keyboard)
+        return {"success": True}
+
+    async def process_title_search(self, user_id: int, _chat_id: int, text: str) -> dict:
+        """Process a title search query typed by the user.
+
+        Searches metadata providers and shows results as selectable buttons.
+        Falls back to manual ID entry if nothing is found.
+        """
+        state = self.get_conversation(user_id)
+        if not state or state.step != ConversationStep.AWAITING_TITLE_SEARCH:
+            return {"success": False, "handled": False}
+
+        query = text.strip()
+        if not query:
+            return {
+                "success": False,
+                "handled": True,
+                "message": "Please type a title to search for.",
+            }
+
+        try:
+            results = await meta_fetcher.search_multiple_results(
+                title=query,
+                limit=5,
+                media_type=state.media_type if state.media_type != "sports" else None,
+                min_similarity=50,
+            )
+        except Exception as e:
+            logger.exception(f"Title search failed for '{query}': {e}")
+            results = []
+
+        if not results:
+            state.step = ConversationStep.AWAITING_MANUAL_IMDB
+            state.touch()
+            self._persist_conversation(state)
+            return {
+                "success": True,
+                "handled": True,
+                "message": (
+                    f"❌ No results found for *{query}*.\n\n"
+                    "Please reply with an external ID instead.\n\n"
+                    "*Supported formats:*\n"
+                    "• IMDb: `tt1234567`\n"
+                    "• TMDB: `tmdb:12345`\n"
+                    "• TVDB: `tvdb:12345`\n"
+                    "• MAL: `mal:12345`\n"
+                    "• Kitsu: `kitsu:12345`"
+                ),
+                "reply_markup": {
+                    "inline_keyboard": [
+                        [{"text": "🔍 Search again", "callback_data": f"search_title:{user_id}"}],
+                        [{"text": "❌ Cancel", "callback_data": f"cancel:{user_id}"}],
+                    ]
+                },
+            }
+
+        # Build keyboard from results — same format as show_match_selection
+        keyboard = []
+        for idx, match in enumerate(results[:5], 1):
+            canonical_id = self._get_canonical_external_id(match) or ""
+            title = match.get("title", "Unknown")
+            year = match.get("year", "")
+            match_type = match.get("type", "movie")
+            type_emoji = "🎬" if match_type == "movie" else "📺"
+            ids = self._collect_match_ids(match)
+
+            short_id = ""
+            if ids.get("imdb"):
+                short_id = ids["imdb"]
+            elif ids.get("tmdb"):
+                short_id = f"tmdb:{ids['tmdb']}"
+            elif ids.get("tvdb"):
+                short_id = f"tvdb:{ids['tvdb']}"
+
+            button_text = f"{idx}. {type_emoji} {title}"
+            if year:
+                button_text += f" ({year})"
+            if short_id:
+                button_text += f" [{short_id}]"
+            if len(button_text) > 60:
+                button_text = button_text[:57] + "..."
+
+            keyboard.append(
+                [
+                    {
+                        "text": button_text,
+                        "callback_data": f"match:{state.user_id}:{canonical_id}",
+                    }
+                ]
+            )
+
+        keyboard.append([{"text": "🔍 Search again", "callback_data": f"search_title:{user_id}"}])
+        keyboard.append([{"text": "📝 Enter external ID manually", "callback_data": f"manual:{user_id}"}])
+        keyboard.append([{"text": "❌ Cancel", "callback_data": f"cancel:{user_id}"}])
+
+        # Move back to AWAITING_MATCH so the match: callback works
+        state.step = ConversationStep.AWAITING_MATCH
+        state.search_results = results
+        state.touch()
+        self._persist_conversation(state)
+
+        return {
+            "success": True,
+            "handled": True,
+            "message": f"🔍 *Search Results for:* {query}\n\nSelect a match:",
+            "reply_markup": {"inline_keyboard": keyboard},
+        }
+
+    async def show_metadata_review(self, state: ConversationState, chat_id: int, message_id: int | None) -> dict:
+        """Show metadata review with edit options.
+
+        Args:
+            state: Conversation state
+            chat_id: Chat ID
+            message_id: Message ID to edit (or None to send new)
+
+        Returns:
+            Dict with result
+        """
+        analysis = state.analysis_result or {}
+        match = state.selected_match or {}
+        overrides = state.metadata_overrides
+        is_sports = state.media_type == "sports"
+
+        title = match.get("title", "Unknown")
+        year = match.get("year")
+        year_str = f" ({year})" if year else ""
+
+        # Build ID display — optional for sports
+        ids = self._collect_match_ids(match)
+        if ids:
+            id_parts = []
+            for provider, pid in ids.items():
+                label = provider.upper() if provider in ("imdb", "tmdb", "tvdb", "mal") else provider.title()
+                id_parts.append(f"{label}: `{pid}`")
+            id_display = " | ".join(id_parts)
+        elif is_sports:
+            id_display = "_None (optional for sports)_"
+        else:
+            canonical_id = self._get_canonical_external_id(match) or "Unknown"
+            id_display = f"`{canonical_id}`"
+
+        # Get metadata values (override > analysis > None)
+        resolution = overrides.get("resolution") or analysis.get("resolution") or "Auto"
+        quality = overrides.get("quality") or analysis.get("quality") or "Auto"
+        codec = overrides.get("codec") or analysis.get("codec") or "Auto"
+        audio = overrides.get("audio") or analysis.get("audio") or "Auto"
+        languages_list = self._get_selected_languages(analysis, overrides)
+        languages = ", ".join(languages_list) if languages_list else "Auto"
+
+        # Series episode info (override > analysis parsed values)
+        is_series = state.media_type == "series"
+        season_number = None
+        episode_number = None
+        if is_series:
+            season_number = overrides.get("season_number")
+            if season_number is None:
+                seasons = analysis.get("seasons")
+                season_number = seasons[0] if seasons else None
+            episode_number = overrides.get("episode_number")
+            if episode_number is None:
+                episodes = analysis.get("episodes")
+                episode_number = episodes[0] if episodes else None
+
+        # Build message
+        size_str = analysis.get("total_size_readable") or analysis.get("file_size_readable") or "Unknown"
+
+        # Custom poster info
+        poster_line = ""
+        if state.custom_poster_url:
+            poster_line = "🖼️ *Poster:* Custom ✓\n"
+        elif is_sports:
+            poster_line = "🖼️ *Poster:* Auto (sports)\n"
+
+        # Episode info line for series
+        episode_line = ""
+        if is_series:
+            s_display = str(season_number) if season_number is not None else "?"
+            e_display = str(episode_number) if episode_number is not None else "?"
+            episode_line = f"📺 *Season:* {s_display} | *Episode:* {e_display}\n"
+
+        # Sports-specific header
+        if is_sports:
+            category_label = match.get("sports_category_label") or SPORTS_CATEGORIES.get(
+                state.sports_category or "", "Sports"
+            )
+            message = (
+                f"📋 *Review Import Details*\n\n"
+                f"🏆 *{title}*{year_str}\n"
+                f"⚽ *Category:* {category_label}\n"
+                f"🆔 {id_display}\n\n"
+                f"📦 *Size:* {size_str}\n"
+                f"📐 *Resolution:* {resolution}\n"
+                f"🎞 *Quality:* {quality}\n"
+                f"💿 *Codec:* {codec}\n"
+                f"🔊 *Audio:* {audio}\n"
+                f"🌐 *Languages:* {languages}\n"
+                f"{poster_line}\n"
+                f"_Tap a field to edit, or confirm to import._"
+            )
+        else:
+            message = (
+                f"📋 *Review Import Details*\n\n"
+                f"🎬 *{title}*{year_str}\n"
+                f"🆔 {id_display}\n\n"
+                f"{episode_line}"
+                f"📦 *Size:* {size_str}\n"
+                f"📐 *Resolution:* {resolution}\n"
+                f"🎞 *Quality:* {quality}\n"
+                f"💿 *Codec:* {codec}\n"
+                f"🔊 *Audio:* {audio}\n"
+                f"🌐 *Languages:* {languages}\n"
+                f"{poster_line}\n"
+                f"_Tap a field to edit, or confirm to import._"
+            )
+
+        # Poster button text
+        poster_btn_text = "🖼️ ✓ Poster" if state.custom_poster_url else "🖼️ Add Poster"
+
+        # Build edit keyboard
+        keyboard = []
+
+        # Series episode edit row (only for series)
+        if is_series:
+            s_btn = f"S{season_number}" if season_number is not None else "S?"
+            e_btn = f"E{episode_number}" if episode_number is not None else "E?"
+            keyboard.append(
+                [
+                    {"text": f"📺 {s_btn}", "callback_data": f"meta_edit:{state.user_id}:season_number"},
+                    {"text": f"📺 {e_btn}", "callback_data": f"meta_edit:{state.user_id}:episode_number"},
+                ]
+            )
+
+        keyboard.extend(
+            [
+                [
+                    {"text": f"📐 {resolution}", "callback_data": f"meta_edit:{state.user_id}:resolution"},
+                    {"text": f"🎞 {quality}", "callback_data": f"meta_edit:{state.user_id}:quality"},
+                ],
+                [
+                    {"text": f"💿 {codec}", "callback_data": f"meta_edit:{state.user_id}:codec"},
+                    {"text": f"🔊 {audio}", "callback_data": f"meta_edit:{state.user_id}:audio"},
+                ],
+                [
+                    {"text": f"🌐 {languages}", "callback_data": f"meta_edit:{state.user_id}:languages"},
+                    {"text": poster_btn_text, "callback_data": f"add_poster:{state.user_id}"},
+                ],
+                [
+                    {"text": "✅ Confirm Import", "callback_data": f"confirm:{state.user_id}"},
+                ],
+                [
+                    {"text": "⬅️ Back", "callback_data": f"back:{state.user_id}"},
+                    {"text": "❌ Cancel", "callback_data": f"cancel:{state.user_id}"},
+                ],
+            ]
+        )
+        if state.batch_item_id:
+            keyboard.append([{"text": "← Back to batch", "callback_data": f"batch:summary:{state.user_id}"}])
+
+        if message_id:
+            await self.edit_message(chat_id, message_id, message, {"inline_keyboard": keyboard})
+        else:
+            state.message_id = None  # Will be set by caller
+
+        return {
+            "success": True,
+            "message": message,
+            "reply_markup": {"inline_keyboard": keyboard},
+        }
+
+    async def show_field_editor(self, user_id: int, chat_id: int, message_id: int, field: str) -> dict:
+        """Show field value selection keyboard.
+
+        Args:
+            user_id: Telegram user ID
+            chat_id: Chat ID
+            message_id: Message ID to edit
+            field: Field name to edit
+
+        Returns:
+            Dict with result
+        """
+        state = self.get_conversation(user_id)
+        if not state:
+            return {"success": False, "message": "Session expired. Please start over."}
+
+        # Season/episode fields require text input instead of option buttons
+        if field in ("season_number", "episode_number"):
+            return await self._show_episode_input_prompt(state, chat_id, message_id, field)
+
+        state.editing_field = field
+        state.step = ConversationStep.AWAITING_FIELD_EDIT
+        state.touch()
+        self._persist_conversation(state)
+
+        # Get options based on field
+        field_config = {
+            "resolution": ("📐 Resolution", RESOLUTION_OPTIONS),
+            "quality": ("🎞 Quality", QUALITY_OPTIONS),
+            "codec": ("💿 Codec", CODEC_OPTIONS),
+            "audio": ("🔊 Audio", AUDIO_OPTIONS),
+            "languages": ("🌐 Languages", LANGUAGE_OPTIONS),
+        }
+
+        field_name, options = field_config.get(field, (field.title(), []))
+
+        message = f"*Select {field_name}:*"
+
+        # Build options keyboard (2 per row)
+        keyboard = []
+        for i in range(0, len(options), 2):
+            row = []
+            for opt in options[i : i + 2]:
+                row.append({"text": opt, "callback_data": f"meta_val:{user_id}:{field}:{opt}"})
+            keyboard.append(row)
+
+        # Add back button
+        keyboard.append([{"text": "⬅️ Back to Review", "callback_data": f"back_review:{user_id}"}])
+
+        await self.edit_message(chat_id, message_id, message, {"inline_keyboard": keyboard})
+
+        return {"success": True}
+
+    async def handle_field_value_selection(
+        self, user_id: int, chat_id: int, message_id: int, field: str, value: str
+    ) -> dict:
+        """Handle field value selection.
+
+        Args:
+            user_id: Telegram user ID
+            chat_id: Chat ID
+            message_id: Message ID to edit
+            field: Field name
+            value: Selected value
+
+        Returns:
+            Dict with result
+        """
+        state = self.get_conversation(user_id)
+        if not state:
+            return {"success": False, "message": "Session expired. Please start over."}
+
+        state.metadata_overrides[field] = value
+        state.step = ConversationStep.AWAITING_METADATA_REVIEW
+        state.touch()
+        self._persist_conversation(state)
+
+        return await self.show_metadata_review(state, chat_id, message_id)
+
+    async def show_poster_input_prompt(self, user_id: int, chat_id: int, message_id: int) -> dict:
+        """Show prompt for user to provide a poster image URL or upload an image.
+
+        Args:
+            user_id: Telegram user ID
+            chat_id: Chat ID
+            message_id: Message ID to edit
+
+        Returns:
+            Dict with result
+        """
+        state = self.get_conversation(user_id)
+        if not state:
+            return {"success": False, "message": "Session expired. Please start over."}
+
+        state.step = ConversationStep.AWAITING_POSTER_INPUT
+        state.touch()
+        self._persist_conversation(state)
+
+        message = (
+            "🖼️ *Add Custom Poster*\n\n"
+            "You can provide a poster image in one of the following ways:\n\n"
+            "• *Send an image URL* - Paste a direct link to an image (jpg, png, webp)\n"
+            "• *Upload an image* - Send an image file directly\n\n"
+            "_The image will be used as the poster for this content._"
+        )
+
+        keyboard = [
+            [{"text": "⬅️ Back to Review", "callback_data": f"back_review:{user_id}"}],
+        ]
+
+        # Add clear button if there's already a custom poster
+        if state.custom_poster_url:
+            keyboard.insert(0, [{"text": "🗑️ Clear Custom Poster", "callback_data": f"clear_poster:{user_id}"}])
+
+        await self.edit_message(chat_id, message_id, message, {"inline_keyboard": keyboard})
+        return {"success": True}
+
+    async def handle_poster_input(self, user_id: int, chat_id: int, poster_url: str) -> dict:
+        """Handle poster URL or image upload from user.
+
+        Args:
+            user_id: Telegram user ID
+            chat_id: Chat ID
+            poster_url: URL of the poster image
+
+        Returns:
+            Dict with result
+        """
+        state = self.get_conversation(user_id)
+        if not state:
+            return {"success": False, "message": "Session expired. Please start over."}
+
+        # Validate URL looks like an image
+        lower_url = poster_url.lower()
+        valid_extensions = (".jpg", ".jpeg", ".png", ".webp", ".gif")
+        is_valid_url = poster_url.startswith("http") and (
+            any(lower_url.endswith(ext) or ext in lower_url for ext in valid_extensions)
+            or "image" in lower_url
+            or "/photo/" in lower_url
+            or "imgur" in lower_url
+            or "postimg" in lower_url
+        )
+
+        if not is_valid_url:
+            await self.send_message(
+                chat_id,
+                "⚠️ *Invalid Image URL*\n\nPlease send a valid image URL (jpg, png, webp) or upload an image directly.",
+            )
+            return {"success": False, "message": "Invalid image URL"}
+
+        state.custom_poster_url = poster_url
+        state.step = ConversationStep.AWAITING_METADATA_REVIEW
+        state.touch()
+        self._persist_conversation(state)
+
+        # Go back to review with confirmation
+        await self.send_message(chat_id, "✅ *Poster Added*\n\nCustom poster has been set.")
+
+        if state.message_id:
+            await self.show_metadata_review(state, chat_id, state.message_id)
+
+        return {"success": True}
+
+    async def _show_episode_input_prompt(
+        self, state: ConversationState, chat_id: int, message_id: int, field: str
+    ) -> dict:
+        """Show text-input prompt for season or episode number."""
+        state.editing_field = field
+        state.step = ConversationStep.AWAITING_EPISODE_INPUT
+        state.touch()
+        self._persist_conversation(state)
+
+        label = "Season Number" if field == "season_number" else "Episode Number"
+        message = f"📺 *Enter {label}*\n\nReply with the {label.lower()} (a number).\n\n*Example:* `3`"
+
+        keyboard = [[{"text": "⬅️ Back to Review", "callback_data": f"back_review:{state.user_id}"}]]
+        await self.edit_message(chat_id, message_id, message, {"inline_keyboard": keyboard})
+        return {"success": True}
+
+    async def process_episode_input(self, user_id: int, chat_id: int, text: str) -> dict:
+        """Process user-typed season or episode number."""
+        state = self.get_conversation(user_id)
+        if not state or state.step != ConversationStep.AWAITING_EPISODE_INPUT:
+            return {"success": False, "handled": False}
+
+        field = state.editing_field
+        if field not in ("season_number", "episode_number"):
+            return {"success": False, "handled": False}
+
+        stripped = text.strip()
+        if not stripped.isdigit():
+            label = "Season" if field == "season_number" else "Episode"
+            return {
+                "success": False,
+                "handled": True,
+                "message": f"Please enter a valid number for {label}.",
+            }
+
+        state.metadata_overrides[field] = int(stripped)
+        state.editing_field = None
+        state.step = ConversationStep.AWAITING_METADATA_REVIEW
+        state.touch()
+        self._persist_conversation(state)
+
+        result = await self.show_metadata_review(state, chat_id, None)
+        return {
+            "success": True,
+            "handled": True,
+            "message": result.get("message"),
+            "reply_markup": result.get("reply_markup"),
+        }
+
+    def _get_episode_info(self, state: ConversationState) -> tuple[int | None, int | None, int | None]:
+        """Resolve season/episode/episode_end from overrides and analysis."""
+        overrides = state.metadata_overrides
+        analysis = state.analysis_result or {}
+
+        season_number = overrides.get("season_number")
+        if season_number is None:
+            seasons = analysis.get("seasons")
+            season_number = seasons[0] if seasons else None
+
+        episode_number = overrides.get("episode_number")
+        episode_end = None
+        if episode_number is None:
+            episodes = analysis.get("episodes")
+            if episodes:
+                episode_number = episodes[0]
+                if len(episodes) > 1:
+                    episode_end = episodes[-1]
+
+        return season_number, episode_number, episode_end
+
+    @staticmethod
+    def _normalize_language_values(value: Any) -> list[str]:
+        """Normalize language input to a clean list of names."""
+        if not value:
+            return []
+        if isinstance(value, str):
+            parts = [part.strip() for part in value.split(",")]
+            return [part for part in parts if part and part.lower() != "auto"]
+        if isinstance(value, (list, tuple, set)):
+            normalized = []
+            for item in value:
+                if isinstance(item, str):
+                    item = item.strip()
+                    if item and item.lower() != "auto":
+                        normalized.append(item)
+            return normalized
+        return []
+
+    def _get_selected_languages(self, analysis: dict, overrides: dict) -> list[str]:
+        """Resolve selected languages (override first, parser fallback)."""
+        override_languages = self._normalize_language_values(overrides.get("languages"))
+        if override_languages:
+            return override_languages
+        return self._normalize_language_values(analysis.get("languages"))
+
+    async def _resolve_language_refs(self, session, language_names: list[str]) -> list:
+        """Get/create Language rows for selected names."""
+        if not language_names:
+            return []
+        resolved = []
+        seen = set()
+        for language_name in language_names:
+            if language_name in seen:
+                continue
+            seen.add(language_name)
+            try:
+                lang = await get_or_create_language(session, language_name)
+                resolved.append(lang)
+            except Exception as error:
+                logger.warning("Failed to resolve language '%s': %s", language_name, error)
+        return resolved
+
+    async def _resolve_telegram_uploader(
+        self,
+        session,
+        mf_user_id: int,
+        anonymous_display_name: str | None = None,
+    ) -> tuple[str, int | None, bool]:
+        """Resolve uploader identity for Telegram imports."""
+        user = await session.get(User, mf_user_id)
+        is_anonymous = bool(user and user.contribute_anonymously)
+        uploader_name, uploader_user_id = resolve_uploader_identity(
+            user,
+            is_anonymous,
+            anonymous_display_name if is_anonymous else None,
+        )
+        return uploader_name, uploader_user_id, is_anonymous
+
+    async def _is_linked_user_anonymous(self, mf_user_id: int) -> bool:
+        """Check if a linked MediaFusion user currently contributes anonymously."""
+        async with get_async_session_context() as session:
+            user = await session.get(User, mf_user_id)
+            return bool(user and user.contribute_anonymously)
+
+    async def show_anonymous_name_prompt(self, user_id: int, chat_id: int, message_id: int) -> dict:
+        """Prompt user for a one-time anonymous display name."""
+        state = self.get_conversation(user_id)
+        if not state:
+            return {"success": False, "message": "Session expired. Please start over."}
+
+        state.step = ConversationStep.AWAITING_ANONYMOUS_NAME
+        state.touch()
+        self._persist_conversation(state)
+
+        message = (
+            "🕶️ *Anonymous Contribution*\n\n"
+            "Send a custom display name for this contribution.\n"
+            "• Max 32 chars\n"
+            "• Allowed: letters, numbers, spaces, `.` `_` `-`\n\n"
+            "_Send text now, or skip to use_ *Anonymous*."
+        )
+        keyboard = [
+            [{"text": "⏭ Skip (use Anonymous)", "callback_data": f"anon_skip:{user_id}"}],
+            [{"text": "⬅️ Back to Review", "callback_data": f"back_review:{user_id}"}],
+            [{"text": "❌ Cancel", "callback_data": f"cancel:{user_id}"}],
+        ]
+        await self.edit_message(chat_id, message_id, message, {"inline_keyboard": keyboard})
+        return {"success": True}
+
+    async def process_anonymous_name_input(self, user_id: int, chat_id: int, text: str) -> dict:
+        """Handle per-contribution anonymous display name input."""
+        state = self.get_conversation(user_id)
+        if not state or state.step != ConversationStep.AWAITING_ANONYMOUS_NAME:
+            return {"success": False, "handled": False}
+
+        normalized_name = normalize_anonymous_display_name(text)
+        if not normalized_name:
+            return {
+                "success": False,
+                "handled": True,
+                "message": "⚠️ Invalid name. Use up to 32 chars with letters, numbers, spaces, `.`, `_`, or `-`.",
+            }
+
+        state.anonymous_display_name = normalized_name
+        state.touch()
+        self._persist_conversation(state)
+
+        target_message_id = state.message_id
+        if not target_message_id:
+            return {"success": False, "handled": True, "message": "Session message expired. Please /cancel and retry."}
+
+        await self.execute_import(user_id, chat_id, target_message_id)
+        return {"success": True, "handled": True}
+
+    async def handle_confirm_import(self, user_id: int, chat_id: int, message_id: int) -> dict:
+        """Handle confirm click, including anonymous-name prompt when needed."""
+        state = self.get_conversation(user_id)
+        if not state:
+            return {"success": False, "message": "Session expired. Please start over."}
+
+        is_linked, mf_user_id = await self.check_user_linked(state.user_id)
+        if not is_linked or not mf_user_id:
+            await self.edit_message(chat_id, message_id, "❌ *Account not linked*\n\nPlease run /login first.")
+            return {"success": False}
+
+        if await self._is_linked_user_anonymous(mf_user_id):
+            state.anonymous_display_name = None
+            state.touch()
+            self._persist_conversation(state)
+            return await self.show_anonymous_name_prompt(user_id, chat_id, message_id)
+
+        await self.execute_import(user_id, chat_id, message_id)
+        return {"success": True}
+
+    async def execute_import(self, user_id: int, chat_id: int, message_id: int) -> dict:
+        """Execute the import and create the stream/contribution.
+
+        Args:
+            user_id: Telegram user ID
+            chat_id: Chat ID
+            message_id: Message ID to edit
+
+        Returns:
+            Dict with result
+        """
+        state = self.get_conversation(user_id)
+        if not state:
+            return {"success": False, "message": "Session expired. Please start over."}
+
+        state.step = ConversationStep.IMPORTING
+        state.touch()
+        self._persist_conversation(state)
+
+        # Show importing message
+        await self.edit_message(chat_id, message_id, "⏳ *Importing content...*\n\nPlease wait...")
+
+        try:
+            # Get MediaFusion user ID
+            _, mf_user_id = await self.check_user_linked(state.user_id)
+            if not mf_user_id:
+                return {"success": False, "message": "❌ Account not linked. Please run /login first."}
+
+            # For sports: use the sports-specific import path
+            content_type = state.content_type
+            result = None
+
+            if state.media_type == "sports":
+                result = await self._import_sports(state, mf_user_id)
+            elif content_type == ContentType.VIDEO:
+                result = await self._import_video(state, mf_user_id)
+            elif content_type == ContentType.MAGNET:
+                result = await self._import_magnet(state, mf_user_id)
+            elif content_type == ContentType.TORRENT_FILE:
+                result = await self._import_torrent_file(state, mf_user_id)
+            elif content_type == ContentType.TORRENT_URL:
+                result = await self._import_torrent_url(state, mf_user_id)
+            elif content_type == ContentType.YOUTUBE:
+                result = await self._import_youtube(state, mf_user_id)
+            elif content_type == ContentType.HTTP:
+                result = await self._import_http(state, mf_user_id)
+            elif content_type == ContentType.NZB:
+                result = await self._import_nzb(state, mf_user_id)
+            elif content_type == ContentType.ACESTREAM:
+                result = await self._import_acestream(state, mf_user_id)
+            else:
+                result = {"success": False, "error": f"Unsupported content type: {content_type}"}
+
+            if result and result.get("success"):
+                match = state.selected_match or {}
+                title = match.get("title", "Content")
+                year = match.get("year")
+                year_str = f" ({year})" if year else ""
+                is_sports = state.media_type == "sports"
+
+                # Build ID block — optional for sports
+                ids = self._collect_match_ids(match)
+                id_lines = []
+                for provider, pid in ids.items():
+                    label = provider.upper() if provider in ("imdb", "tmdb", "tvdb", "mal") else provider.title()
+                    id_lines.append(f"  {label}: `{pid}`")
+
+                if is_sports:
+                    category_label = match.get("sports_category_label") or SPORTS_CATEGORIES.get(
+                        state.sports_category or "", "Sports"
+                    )
+                    header = f"🏆 *{title}*{year_str}\n⚽ *Category:* {category_label}"
+                    if id_lines:
+                        header += "\n🆔 IDs:\n" + "\n".join(id_lines)
+                else:
+                    canonical_id = self._get_canonical_external_id(match) or "Unknown"
+                    id_block = "\n".join(id_lines) if id_lines else f"  `{canonical_id}`"
+                    header = f"🎬 *{title}*{year_str}\n🆔 IDs:\n{id_block}"
+
+                success_message = f"✅ *Import Successful!*\n\n{header}\n\nYour content has been added to MediaFusion!"
+
+                if result.get("auto_approved"):
+                    success_message += "\n\n✓ _Auto-approved_"
+                else:
+                    success_message += "\n\n⏳ _Pending review_"
+
+                await self.edit_message(chat_id, message_id, success_message)
+                batch_item_id = state.batch_item_id
+                self.clear_conversation(user_id)
+                if batch_item_id:
+                    await self.finish_batch_item_review(user_id, batch_item_id, success=True)
+                return {"success": True, "message": "Import successful"}
+            else:
+                error = result.get("error", "Unknown error") if result else "Import failed"
+                await self.edit_message(chat_id, message_id, f"❌ *Import Failed*\n\n{error}")
+                state.step = ConversationStep.AWAITING_METADATA_REVIEW
+                self._persist_conversation(state)
+                return {"success": False, "message": error}
+
+        except Exception as e:
+            logger.exception(f"Import error: {e}")
+            await self.edit_message(chat_id, message_id, f"❌ *Import Error*\n\n{str(e)}")
+            state.step = ConversationStep.AWAITING_METADATA_REVIEW
+            self._persist_conversation(state)
+            return {"success": False, "message": str(e)}
+
+    async def _record_contribution(
+        self,
+        mf_user_id: int,
+        contribution_type: str,
+        target_id: str | None,
+        data: dict,
+        *,
+        is_anonymous: bool = False,
+        anonymous_display_name: str | None = None,
+    ) -> tuple[bool, bool]:
+        """Create a Contribution record and return (recorded, auto_approved)."""
+        try:
+            async with get_async_session_context() as session:
+                linked_user = await session.get(User, mf_user_id)
+                if linked_user is None:
+                    logger.warning("Failed to record contribution (%s): user not found", contribution_type)
+                    return False, False
+
+                is_privileged_reviewer = linked_user.role in {UserRole.MODERATOR, UserRole.ADMIN}
+                should_auto_approve = is_privileged_reviewer or (linked_user.is_active and not is_anonymous)
+
+                contribution_data = dict(data)
+                contribution_data["is_anonymous"] = is_anonymous
+                contribution_data["is_public"] = should_auto_approve
+                if is_anonymous and anonymous_display_name:
+                    contribution_data["anonymous_display_name"] = anonymous_display_name
+
+                contribution = Contribution(
+                    user_id=None if is_anonymous else mf_user_id,
+                    contribution_type=contribution_type,
+                    target_id=target_id,
+                    data=contribution_data,
+                    status=ContributionStatus.APPROVED if should_auto_approve else ContributionStatus.PENDING,
+                    admin_review_requested=False,
+                    reviewed_by="auto" if should_auto_approve else None,
+                    reviewed_at=datetime.now(pytz.UTC) if should_auto_approve else None,
+                    review_notes=(
+                        "Auto-approved: Privileged reviewer"
+                        if is_privileged_reviewer
+                        else ("Auto-approved: Active user content import" if should_auto_approve else None)
+                    ),
+                )
+                session.add(contribution)
+                await session.commit()
+                await session.refresh(contribution)
+
+                if contribution.status == ContributionStatus.PENDING:
+                    uploader_name, _ = resolve_uploader_identity(
+                        linked_user,
+                        is_anonymous,
+                        anonymous_display_name,
+                    )
+                    await send_pending_contribution_notification(
+                        {
+                            "contribution_id": contribution.id,
+                            "contribution_type": contribution.contribution_type,
+                            "target_id": contribution.target_id,
+                            "uploader_name": uploader_name,
+                            "data": contribution.data,
+                        }
+                    )
+                return True, should_auto_approve
+        except Exception as e:
+            logger.warning(f"Failed to record contribution ({contribution_type}): {e}")
+        return False, False
+
+    def _get_contribution_meta_type(self, media_type: str | None) -> str:
+        """Map wizard media type to contribution import meta_type."""
+        return "series" if media_type == "series" else "movie"
+
+    async def _import_video(self, state: ConversationState, mf_user_id: int) -> dict:
+        """Import a video file as TelegramStream."""
+        analysis = state.analysis_result or {}
+        match = state.selected_match or {}
+        overrides = state.metadata_overrides
+        selected_languages = self._get_selected_languages(analysis, overrides)
+        meta_type = self._get_contribution_meta_type(state.media_type)
+
+        external_id = self._get_canonical_external_id(match)
+        if not external_id:
+            return {"success": False, "error": "No external ID selected."}
+        is_anonymous = await self._is_linked_user_anonymous(mf_user_id)
+
+        season_number, episode_number, episode_end = self._get_episode_info(state)
+
+        content_info = {
+            "user_id": state.user_id,
+            "chat_id": state.chat_id,
+            "message_id": state.original_message_id or 0,
+            "file_id": analysis.get("file_id"),
+            "file_unique_id": analysis.get("file_unique_id"),
+            "file_name": analysis.get("file_name", "video"),
+            "file_size": analysis.get("file_size"),
+            "mime_type": analysis.get("mime_type"),
+            "meta_id": external_id,
+            "needs_linking": False,
+            "resolution": overrides.get("resolution") or analysis.get("resolution"),
+            "quality": overrides.get("quality") or analysis.get("quality"),
+            "codec": overrides.get("codec") or analysis.get("codec"),
+            "languages": selected_languages,
+            "season_number": season_number,
+            "episode_number": episode_number,
+            "episode_end": episode_end,
+            "anonymous_display_name": state.anonymous_display_name if is_anonymous else None,
+        }
+
+        recorded, auto_approved = await self._record_contribution(
+            mf_user_id,
+            "telegram",
+            external_id,
+            {
+                "title": analysis.get("file_name") or analysis.get("parsed_title") or "Telegram Video",
+                "file_name": analysis.get("file_name"),
+                "file_size": analysis.get("file_size"),
+                "file_id": analysis.get("file_id"),
+                "file_unique_id": analysis.get("file_unique_id"),
+                "meta_type": meta_type,
+                "meta_id": external_id,
+                "resolution": overrides.get("resolution") or analysis.get("resolution"),
+                "quality": overrides.get("quality") or analysis.get("quality"),
+                "codec": overrides.get("codec") or analysis.get("codec"),
+                "languages": selected_languages,
+                "season_number": season_number,
+                "episode_number": episode_number,
+                "episode_end": episode_end,
+            },
+            is_anonymous=is_anonymous,
+            anonymous_display_name=state.anonymous_display_name if is_anonymous else None,
+        )
+        if not recorded:
+            return {"success": False, "error": "Failed to record contribution."}
+
+        content_info["is_public"] = auto_approved
+        stored = await self._store_forwarded_content(content_info)
+        return {
+            "success": stored,
+            "auto_approved": auto_approved,
+            "error": "Failed to store video" if not stored else None,
+        }
+
+    async def _import_magnet(self, state: ConversationState, mf_user_id: int) -> dict:
+        """Import a magnet link as TorrentStream."""
+        analysis = state.analysis_result or {}
+        match = state.selected_match or {}
+        overrides = state.metadata_overrides
+        selected_languages = self._get_selected_languages(analysis, overrides)
+        meta_type = self._get_contribution_meta_type(state.media_type)
+
+        external_id = self._get_canonical_external_id(match)
+        if not external_id:
+            return {"success": False, "error": "No external ID selected."}
+
+        info_hash = analysis.get("info_hash")
+        if not info_hash:
+            return {"success": False, "error": "No info hash from analysis."}
+        normalized_hash = str(info_hash).strip().lower()
+
+        async with get_async_session_context() as session:
+            # Get or create media
+            media = await crud.get_media_by_external_id(session, external_id)
+            if not media:
+                media = await fetch_and_create_media_from_external(
+                    session, external_id, state.media_type, analysis.get("parsed_title")
+                )
+                if not media:
+                    return {"success": False, "error": f"Could not find or create media for {external_id}"}
+
+            # Check if stream already exists
+            existing = await session.exec(
+                select(TorrentStream).where(func.lower(TorrentStream.info_hash) == normalized_hash)
+            )
+            if existing.first():
+                return {"success": False, "error": "Stream with this info hash already exists."}
+
+            uploader_name, uploader_user_id, is_anonymous = await self._resolve_telegram_uploader(
+                session,
+                mf_user_id,
+                state.anonymous_display_name,
+            )
+            language_refs = await self._resolve_language_refs(session, selected_languages)
+
+            contribution_payload = {
+                "info_hash": normalized_hash,
+                "meta_type": meta_type,
+                "meta_id": external_id,
+                "title": analysis.get("parsed_title") or analysis.get("torrent_name") or "Unknown",
+                "name": analysis.get("torrent_name") or analysis.get("parsed_title"),
+                "total_size": analysis.get("total_size"),
+                "resolution": overrides.get("resolution") or analysis.get("resolution"),
+                "quality": overrides.get("quality") or analysis.get("quality"),
+                "codec": overrides.get("codec") or analysis.get("codec"),
+                "languages": selected_languages,
+                "file_count": analysis.get("file_count", 1),
+            }
+            recorded, auto_approved = await self._record_contribution(
+                mf_user_id,
+                "torrent",
+                external_id,
+                contribution_payload,
+                is_anonymous=is_anonymous,
+                anonymous_display_name=state.anonymous_display_name if is_anonymous else None,
+            )
+            if not recorded:
+                return {"success": False, "error": "Failed to record contribution."}
+
+            # Create the torrent stream
+            await create_torrent_stream(
+                session,
+                info_hash=normalized_hash,
+                name=analysis.get("torrent_name") or analysis.get("parsed_title") or "Unknown",
+                size=analysis.get("total_size") or 0,
+                source="telegram_bot",
+                media_id=media.id,
+                resolution=overrides.get("resolution") or analysis.get("resolution"),
+                quality=overrides.get("quality") or analysis.get("quality"),
+                codec=overrides.get("codec") or analysis.get("codec"),
+                uploader=uploader_name,
+                uploader_user_id=uploader_user_id,
+                is_public=auto_approved,
+                languages=language_refs,
+            )
+
+            await session.commit()
+
+        return {"success": True, "auto_approved": auto_approved}
+
+    async def _import_torrent_file(self, state: ConversationState, mf_user_id: int) -> dict:
+        """Import a torrent file."""
+        # Similar to magnet import but uses torrent content
+        return await self._import_magnet(state, mf_user_id)
+
+    async def _import_torrent_url(self, state: ConversationState, mf_user_id: int) -> dict:
+        """Import a torrent from a URL.
+
+        This uses the same logic as magnet/torrent file import since we already
+        have the info_hash from the analysis step.
+        """
+        # The analysis step already fetched and parsed the torrent,
+        # so we can reuse the magnet import logic which uses the info_hash
+        return await self._import_magnet(state, mf_user_id)
+
+    async def _import_youtube(self, state: ConversationState, mf_user_id: int) -> dict:
+        """Import a YouTube video."""
+        analysis = state.analysis_result or {}
+        match = state.selected_match or {}
+        overrides = state.metadata_overrides
+        selected_languages = self._get_selected_languages(analysis, overrides)
+        meta_type = self._get_contribution_meta_type(state.media_type)
+
+        external_id = self._get_canonical_external_id(match)
+        if not external_id:
+            return {"success": False, "error": "No external ID selected."}
+
+        video_id = analysis.get("video_id")
+        if not video_id:
+            return {"success": False, "error": "No YouTube video ID."}
+
+        async with get_async_session_context() as session:
+            # Get or create media
+            media = await crud.get_media_by_external_id(session, external_id)
+            if not media:
+                media = await fetch_and_create_media_from_external(
+                    session, external_id, state.media_type, analysis.get("title")
+                )
+                if not media:
+                    return {"success": False, "error": f"Could not find or create media for {external_id}"}
+
+            # Check if stream already exists
+            existing = await session.exec(select(YouTubeStream).where(YouTubeStream.video_id == video_id))
+            if existing.first():
+                return {"success": False, "error": "This YouTube video is already in the database."}
+
+            uploader_name, uploader_user_id, is_anonymous = await self._resolve_telegram_uploader(
+                session,
+                mf_user_id,
+                state.anonymous_display_name,
+            )
+            contribution_payload = {
+                "video_id": video_id,
+                "title": analysis.get("title") or "YouTube Video",
+                "meta_type": meta_type,
+                "meta_id": external_id,
+                "resolution": overrides.get("resolution") or analysis.get("resolution"),
+                "quality": overrides.get("quality") or analysis.get("quality"),
+                "codec": overrides.get("codec") or analysis.get("codec"),
+                "languages": selected_languages,
+                "is_live": analysis.get("is_live", False),
+            }
+            recorded, auto_approved = await self._record_contribution(
+                mf_user_id,
+                "youtube",
+                external_id,
+                contribution_payload,
+                is_anonymous=is_anonymous,
+                anonymous_display_name=state.anonymous_display_name if is_anonymous else None,
+            )
+            if not recorded:
+                return {"success": False, "error": "Failed to record contribution."}
+
+            # Create the YouTube stream (uses kwargs for extra fields)
+            yt_stream = await create_youtube_stream(
+                session,
+                video_id=video_id,
+                name=analysis.get("title") or "YouTube Video",
+                media_id=media.id,
+                source="telegram_bot",
+                is_live=analysis.get("is_live", False),
+                uploader=uploader_name,
+                uploader_user_id=uploader_user_id,
+                is_public=auto_approved,
+                resolution=overrides.get("resolution") or analysis.get("resolution"),
+            )
+            language_refs = await self._resolve_language_refs(session, selected_languages)
+            if language_refs:
+                await add_languages_to_stream(session, yt_stream.stream_id, [lang.id for lang in language_refs])
+
+            await session.commit()
+
+        return {"success": True, "auto_approved": auto_approved}
+
+    async def _import_http(self, state: ConversationState, mf_user_id: int) -> dict:
+        """Import an HTTP direct link."""
+        analysis = state.analysis_result or {}
+        match = state.selected_match or {}
+        overrides = state.metadata_overrides
+        selected_languages = self._get_selected_languages(analysis, overrides)
+        meta_type = self._get_contribution_meta_type(state.media_type)
+
+        external_id = self._get_canonical_external_id(match)
+        if not external_id:
+            return {"success": False, "error": "No external ID selected."}
+
+        url = analysis.get("url")
+        if not url:
+            return {"success": False, "error": "No URL provided."}
+
+        async with get_async_session_context() as session:
+            # Get or create media
+            media = await crud.get_media_by_external_id(session, external_id)
+            if not media:
+                media = await fetch_and_create_media_from_external(
+                    session, external_id, state.media_type, analysis.get("parsed_title")
+                )
+                if not media:
+                    return {"success": False, "error": f"Could not find or create media for {external_id}"}
+
+            uploader_name, uploader_user_id, is_anonymous = await self._resolve_telegram_uploader(
+                session,
+                mf_user_id,
+                state.anonymous_display_name,
+            )
+            contribution_payload = {
+                "url": url,
+                "title": analysis.get("parsed_title") or analysis.get("file_name") or "HTTP Stream",
+                "meta_type": meta_type,
+                "meta_id": external_id,
+                "format": analysis.get("content_type"),
+                "resolution": overrides.get("resolution") or analysis.get("resolution"),
+                "quality": overrides.get("quality") or analysis.get("quality"),
+                "codec": overrides.get("codec") or analysis.get("codec"),
+                "languages": selected_languages,
+            }
+            recorded, auto_approved = await self._record_contribution(
+                mf_user_id,
+                "http",
+                external_id,
+                contribution_payload,
+                is_anonymous=is_anonymous,
+                anonymous_display_name=state.anonymous_display_name if is_anonymous else None,
+            )
+            if not recorded:
+                return {"success": False, "error": "Failed to record contribution."}
+
+            # Create the HTTP stream
+            http_stream = await create_http_stream(
+                session,
+                url=url,
+                name=analysis.get("file_name") or analysis.get("parsed_title") or "HTTP Stream",
+                media_id=media.id,
+                source="telegram_bot",
+                size=analysis.get("file_size"),
+                format=analysis.get("content_type"),
+                uploader=uploader_name,
+                uploader_user_id=uploader_user_id,
+                is_public=auto_approved,
+                resolution=overrides.get("resolution") or analysis.get("resolution"),
+                quality=overrides.get("quality") or analysis.get("quality"),
+                codec=overrides.get("codec") or analysis.get("codec"),
+            )
+            language_refs = await self._resolve_language_refs(session, selected_languages)
+            if language_refs:
+                await add_languages_to_stream(session, http_stream.stream_id, [lang.id for lang in language_refs])
+
+            await session.commit()
+
+        return {"success": True, "auto_approved": auto_approved}
+
+    async def _import_nzb(self, state: ConversationState, mf_user_id: int) -> dict:
+        """Import an NZB URL."""
+        analysis = state.analysis_result or {}
+        match = state.selected_match or {}
+        overrides = state.metadata_overrides
+        selected_languages = self._get_selected_languages(analysis, overrides)
+        meta_type = self._get_contribution_meta_type(state.media_type)
+
+        external_id = self._get_canonical_external_id(match)
+        if not external_id:
+            return {"success": False, "error": "No external ID selected."}
+
+        nzb_url = analysis.get("nzb_url")
+        if not nzb_url:
+            return {"success": False, "error": "No NZB URL provided."}
+
+        async with get_async_session_context() as session:
+            # Get or create media
+            media = await crud.get_media_by_external_id(session, external_id)
+            if not media:
+                media = await fetch_and_create_media_from_external(
+                    session, external_id, state.media_type, analysis.get("parsed_title")
+                )
+                if not media:
+                    return {"success": False, "error": f"Could not find or create media for {external_id}"}
+
+            # Generate a unique NZB GUID from the URL
+            nzb_guid = hashlib.sha256(nzb_url.encode()).hexdigest()[:32]
+
+            # Check if stream already exists
+            existing = await session.exec(select(UsenetStream).where(UsenetStream.nzb_guid == nzb_guid))
+            if existing.first():
+                return {"success": False, "error": "This NZB is already in the database."}
+
+            uploader_name, uploader_user_id, is_anonymous = await self._resolve_telegram_uploader(
+                session,
+                mf_user_id,
+                state.anonymous_display_name,
+            )
+            language_refs = await self._resolve_language_refs(session, selected_languages)
+            contribution_payload = {
+                "nzb_guid": nzb_guid,
+                "nzb_url": nzb_url,
+                "meta_type": meta_type,
+                "meta_id": external_id,
+                "title": analysis.get("nzb_name") or "NZB Content",
+                "name": analysis.get("nzb_name") or "NZB Content",
+                "indexer": "telegram_bot",
+                "total_size": 0,
+                "resolution": overrides.get("resolution") or analysis.get("resolution"),
+                "quality": overrides.get("quality") or analysis.get("quality"),
+                "codec": overrides.get("codec") or analysis.get("codec"),
+                "languages": selected_languages,
+                "file_count": 1,
+            }
+            recorded, auto_approved = await self._record_contribution(
+                mf_user_id,
+                "nzb",
+                external_id,
+                contribution_payload,
+                is_anonymous=is_anonymous,
+                anonymous_display_name=state.anonymous_display_name if is_anonymous else None,
+            )
+            if not recorded:
+                return {"success": False, "error": "Failed to record contribution."}
+
+            # Create the Usenet stream
+            await create_usenet_stream(
+                session,
+                nzb_guid=nzb_guid,
+                name=analysis.get("nzb_name") or "NZB Content",
+                size=0,  # Size unknown from URL
+                indexer="telegram_bot",
+                media_id=media.id,
+                nzb_url=nzb_url,
+                resolution=overrides.get("resolution") or analysis.get("resolution"),
+                quality=overrides.get("quality") or analysis.get("quality"),
+                codec=overrides.get("codec") or analysis.get("codec"),
+                uploader=uploader_name,
+                uploader_user_id=uploader_user_id,
+                is_public=auto_approved,
+                languages=language_refs,
+            )
+
+            await session.commit()
+
+        return {"success": True, "auto_approved": auto_approved}
+
+    async def _import_acestream(self, state: ConversationState, mf_user_id: int) -> dict:
+        """Import an AceStream content ID."""
+        analysis = state.analysis_result or {}
+        match = state.selected_match or {}
+        overrides = state.metadata_overrides
+        selected_languages = self._get_selected_languages(analysis, overrides)
+        meta_type = self._get_contribution_meta_type(state.media_type)
+
+        external_id = self._get_canonical_external_id(match)
+        if not external_id:
+            return {"success": False, "error": "No external ID selected."}
+
+        content_id = analysis.get("content_id")
+        if not content_id:
+            return {"success": False, "error": "No AceStream content ID."}
+
+        async with get_async_session_context() as session:
+            # Get or create media
+            media = await crud.get_media_by_external_id(session, external_id)
+            if not media:
+                media = await fetch_and_create_media_from_external(
+                    session, external_id, state.media_type, match.get("title")
+                )
+                if not media:
+                    return {"success": False, "error": f"Could not find or create media for {external_id}"}
+
+            # Check if stream already exists
+            existing = await session.exec(select(AceStreamStream).where(AceStreamStream.content_id == content_id))
+            if existing.first():
+                return {"success": False, "error": "This AceStream is already in the database."}
+
+            uploader_name, uploader_user_id, is_anonymous = await self._resolve_telegram_uploader(
+                session,
+                mf_user_id,
+                state.anonymous_display_name,
+            )
+            contribution_payload = {
+                "content_id": content_id,
+                "info_hash": analysis.get("info_hash"),
+                "title": match.get("title") or analysis.get("parsed_title") or "AceStream",
+                "meta_type": meta_type,
+                "meta_id": external_id,
+                "resolution": overrides.get("resolution") or analysis.get("resolution"),
+                "quality": overrides.get("quality") or analysis.get("quality"),
+                "codec": overrides.get("codec") or analysis.get("codec"),
+                "languages": selected_languages,
+            }
+            recorded, auto_approved = await self._record_contribution(
+                mf_user_id,
+                "acestream",
+                external_id,
+                contribution_payload,
+                is_anonymous=is_anonymous,
+                anonymous_display_name=state.anonymous_display_name if is_anonymous else None,
+            )
+            if not recorded:
+                return {"success": False, "error": "Failed to record contribution."}
+
+            # Create the AceStream
+            acestream = await create_acestream_stream(
+                session,
+                content_id=content_id,
+                name=match.get("title") or "AceStream",
+                media_id=media.id,
+                source="telegram_bot",
+                uploader=uploader_name,
+                uploader_user_id=uploader_user_id,
+                is_public=auto_approved,
+                resolution=overrides.get("resolution") or analysis.get("resolution"),
+            )
+            language_refs = await self._resolve_language_refs(session, selected_languages)
+            if language_refs:
+                await add_languages_to_stream(session, acestream.stream_id, [lang.id for lang in language_refs])
+
+            await session.commit()
+
+        return {"success": True, "auto_approved": auto_approved}
+
+    async def _import_sports(self, state: ConversationState, mf_user_id: int) -> dict:
+        """Import sports content.
+
+        Sports content does not require an external ID (IMDb, TMDB, etc.).
+        It creates a Media record with type=MOVIE (for VOD), links it to the
+        sports catalog, and creates the appropriate stream type.
+        """
+        analysis = state.analysis_result or {}
+        match = state.selected_match or {}
+        overrides = state.metadata_overrides
+        selected_languages = self._get_selected_languages(analysis, overrides)
+        sports_category = state.sports_category or "other_sports"
+        is_anonymous = await self._is_linked_user_anonymous(mf_user_id)
+
+        event_title = (
+            match.get("title")
+            or analysis.get("parsed_title")
+            or analysis.get("torrent_name")
+            or analysis.get("file_name")
+            or "Sports Event"
+        )
+
+        # Get year from match (set in handle_sports_category_selection) or analysis
+        year = match.get("year") or analysis.get("year")
+
+        # Check if an external ID was (optionally) set
+        external_id = self._get_canonical_external_id(match)
+
+        async with get_async_session_context() as session:
+            media = None
+
+            # If we have an external ID, try to find existing media
+            if external_id:
+                media = await crud.get_media_by_external_id(session, external_id)
+                if not media:
+                    media = await fetch_and_create_media_from_external(session, external_id, "movie", event_title)
+
+            # If no external ID or creation via external ID failed, create media directly
+            # Sports VOD content is stored as movie (events type is for live content only)
+            if not media:
+                media = Media(
+                    type=MediaType.MOVIE,
+                    title=event_title,
+                    year=year,
+                    status="released",  # Set as released so it shows in catalog
+                    description=f"{SPORTS_CATEGORIES.get(sports_category, 'Sports')} event",
+                )
+                session.add(media)
+                await session.flush()
+
+                # Add sport-specific genre
+                genre = await get_or_create_genre(session, SPORTS_CATEGORIES.get(sports_category, "Sports"))
+                session.add(MediaGenreLink(media_id=media.id, genre_id=genre.id))
+
+                # Add sports poster/background from SPORTS_ARTIFACTS if no external ID
+                # (external ID content gets images from metadata providers)
+                await self._add_sports_images(
+                    session, media.id, sports_category, custom_poster_url=state.custom_poster_url
+                )
+
+            # Always link to the sports catalog
+            catalog = await get_or_create_catalog(session, sports_category)
+            # Check if link already exists
+            existing_link = await session.exec(
+                select(MediaCatalogLink).where(
+                    MediaCatalogLink.media_id == media.id,
+                    MediaCatalogLink.catalog_id == catalog.id,
+                )
+            )
+            if not existing_link.first():
+                session.add(MediaCatalogLink(media_id=media.id, catalog_id=catalog.id))
+
+            # Create the appropriate stream based on content type
+            content_type = state.content_type
+            canonical_meta_id = external_id or f"mf:{media.id}"
+            contribution_type = ""
+            contribution_payload: dict = {}
+            normalized_hash: str | None = None
+            http_url: str | None = None
+            ace_content_id: str | None = None
+            youtube_video_id: str | None = None
+            nzb_url: str | None = None
+            nzb_guid: str | None = None
+
+            if content_type in (ContentType.MAGNET, ContentType.TORRENT_FILE, ContentType.TORRENT_URL):
+                info_hash = analysis.get("info_hash")
+                if not info_hash:
+                    return {"success": False, "error": "No info hash from analysis."}
+                normalized_hash = str(info_hash).strip().lower()
+
+                existing = await session.exec(
+                    select(TorrentStream).where(func.lower(TorrentStream.info_hash) == normalized_hash)
+                )
+                if existing.first():
+                    return {"success": False, "error": "Stream with this info hash already exists."}
+                contribution_type = "torrent"
+                contribution_payload = {
+                    "info_hash": normalized_hash,
+                    "meta_type": "movie",
+                    "meta_id": canonical_meta_id,
+                    "title": event_title,
+                    "name": analysis.get("torrent_name") or event_title,
+                    "total_size": analysis.get("total_size") or 0,
+                    "resolution": overrides.get("resolution") or analysis.get("resolution"),
+                    "quality": overrides.get("quality") or analysis.get("quality"),
+                    "codec": overrides.get("codec") or analysis.get("codec"),
+                    "languages": selected_languages,
+                    "file_count": analysis.get("file_count", 1),
+                    "sports_category": sports_category,
+                }
+
+            elif content_type == ContentType.HTTP:
+                http_url = analysis.get("url")
+                if not http_url:
+                    return {"success": False, "error": "No URL provided."}
+                contribution_type = "http"
+                contribution_payload = {
+                    "url": http_url,
+                    "title": analysis.get("parsed_title") or event_title,
+                    "meta_type": "movie",
+                    "meta_id": canonical_meta_id,
+                    "format": analysis.get("content_type"),
+                    "resolution": overrides.get("resolution") or analysis.get("resolution"),
+                    "quality": overrides.get("quality") or analysis.get("quality"),
+                    "codec": overrides.get("codec") or analysis.get("codec"),
+                    "languages": selected_languages,
+                    "sports_category": sports_category,
+                }
+
+            elif content_type == ContentType.ACESTREAM:
+                ace_content_id = analysis.get("content_id")
+                if not ace_content_id:
+                    return {"success": False, "error": "No AceStream content ID."}
+
+                existing = await session.exec(
+                    select(AceStreamStream).where(AceStreamStream.content_id == ace_content_id)
+                )
+                if existing.first():
+                    return {"success": False, "error": "This AceStream is already in the database."}
+                contribution_type = "acestream"
+                contribution_payload = {
+                    "content_id": ace_content_id,
+                    "info_hash": analysis.get("info_hash"),
+                    "title": event_title,
+                    "meta_type": "movie",
+                    "meta_id": canonical_meta_id,
+                    "resolution": overrides.get("resolution") or analysis.get("resolution"),
+                    "quality": overrides.get("quality") or analysis.get("quality"),
+                    "codec": overrides.get("codec") or analysis.get("codec"),
+                    "languages": selected_languages,
+                    "sports_category": sports_category,
+                }
+
+            elif content_type == ContentType.VIDEO:
+                contribution_type = "telegram"
+                contribution_payload = {
+                    "title": analysis.get("file_name") or event_title,
+                    "file_name": analysis.get("file_name"),
+                    "file_size": analysis.get("file_size"),
+                    "file_id": analysis.get("file_id"),
+                    "file_unique_id": analysis.get("file_unique_id"),
+                    "meta_type": "movie",
+                    "meta_id": canonical_meta_id,
+                    "resolution": overrides.get("resolution") or analysis.get("resolution"),
+                    "quality": overrides.get("quality") or analysis.get("quality"),
+                    "codec": overrides.get("codec") or analysis.get("codec"),
+                    "languages": selected_languages,
+                    "sports_category": sports_category,
+                }
+
+            elif content_type == ContentType.YOUTUBE:
+                youtube_video_id = analysis.get("video_id")
+                if not youtube_video_id:
+                    return {"success": False, "error": "No YouTube video ID."}
+                existing = await session.exec(select(YouTubeStream).where(YouTubeStream.video_id == youtube_video_id))
+                if existing.first():
+                    return {"success": False, "error": "This YouTube video is already in the database."}
+                contribution_type = "youtube"
+                contribution_payload = {
+                    "video_id": youtube_video_id,
+                    "title": analysis.get("title") or event_title,
+                    "meta_type": "movie",
+                    "meta_id": canonical_meta_id,
+                    "resolution": overrides.get("resolution") or analysis.get("resolution"),
+                    "quality": overrides.get("quality") or analysis.get("quality"),
+                    "codec": overrides.get("codec") or analysis.get("codec"),
+                    "languages": selected_languages,
+                    "is_live": analysis.get("is_live", False),
+                    "sports_category": sports_category,
+                }
+
+            elif content_type == ContentType.NZB:
+                nzb_url = analysis.get("nzb_url")
+                if not nzb_url:
+                    return {"success": False, "error": "No NZB URL provided."}
+                nzb_guid = hashlib.sha256(nzb_url.encode()).hexdigest()[:32]
+                existing = await session.exec(select(UsenetStream).where(UsenetStream.nzb_guid == nzb_guid))
+                if existing.first():
+                    return {"success": False, "error": "This NZB is already in the database."}
+                contribution_type = "nzb"
+                contribution_payload = {
+                    "nzb_guid": nzb_guid,
+                    "nzb_url": nzb_url,
+                    "title": analysis.get("nzb_name") or event_title,
+                    "name": analysis.get("nzb_name") or event_title,
+                    "meta_type": "movie",
+                    "meta_id": canonical_meta_id,
+                    "indexer": "telegram_bot",
+                    "total_size": 0,
+                    "resolution": overrides.get("resolution") or analysis.get("resolution"),
+                    "quality": overrides.get("quality") or analysis.get("quality"),
+                    "codec": overrides.get("codec") or analysis.get("codec"),
+                    "languages": selected_languages,
+                    "file_count": 1,
+                    "sports_category": sports_category,
+                }
+
+            else:
+                return {"success": False, "error": f"Unsupported content type for sports: {content_type}"}
+
+            # Ensure media + catalog state is committed before recording contribution,
+            # so mf:<id> can be resolved by approval processing.
+            await session.commit()
+            recorded, auto_approved = await self._record_contribution(
+                mf_user_id,
+                contribution_type,
+                canonical_meta_id,
+                contribution_payload,
+                is_anonymous=is_anonymous,
+                anonymous_display_name=state.anonymous_display_name if is_anonymous else None,
+            )
+            if not recorded:
+                return {"success": False, "error": "Failed to record contribution."}
+
+            # Video stream creation is delegated to forwarded-content storage.
+            if content_type == ContentType.VIDEO:
+                content_info = {
+                    "user_id": state.user_id,
+                    "chat_id": state.chat_id,
+                    "message_id": state.original_message_id or 0,
+                    "file_id": analysis.get("file_id"),
+                    "file_unique_id": analysis.get("file_unique_id"),
+                    "file_name": analysis.get("file_name", "video"),
+                    "file_size": analysis.get("file_size"),
+                    "mime_type": analysis.get("mime_type"),
+                    "meta_id": canonical_meta_id,
+                    "needs_linking": False,
+                    "resolution": overrides.get("resolution") or analysis.get("resolution"),
+                    "quality": overrides.get("quality") or analysis.get("quality"),
+                    "codec": overrides.get("codec") or analysis.get("codec"),
+                    "languages": selected_languages,
+                    "anonymous_display_name": state.anonymous_display_name if is_anonymous else None,
+                    "is_public": auto_approved,
+                }
+                stored = await self._store_forwarded_content(content_info)
+                return {
+                    "success": stored,
+                    "auto_approved": auto_approved,
+                    "error": "Failed to store video" if not stored else None,
+                }
+
+            uploader_name, uploader_user_id, _ = await self._resolve_telegram_uploader(
+                session,
+                mf_user_id,
+                state.anonymous_display_name,
+            )
+            language_refs = await self._resolve_language_refs(session, selected_languages)
+
+            if content_type in (ContentType.MAGNET, ContentType.TORRENT_FILE, ContentType.TORRENT_URL):
+                if not normalized_hash:
+                    return {"success": False, "error": "No info hash from analysis."}
+                await create_torrent_stream(
+                    session,
+                    info_hash=normalized_hash,
+                    name=analysis.get("torrent_name") or event_title,
+                    size=analysis.get("total_size") or 0,
+                    source="telegram_bot",
+                    media_id=media.id,
+                    resolution=overrides.get("resolution") or analysis.get("resolution"),
+                    quality=overrides.get("quality") or analysis.get("quality"),
+                    codec=overrides.get("codec") or analysis.get("codec"),
+                    uploader=uploader_name,
+                    uploader_user_id=uploader_user_id,
+                    is_public=auto_approved,
+                    languages=language_refs,
+                )
+            elif content_type == ContentType.HTTP:
+                if not http_url:
+                    return {"success": False, "error": "No URL provided."}
+                http_stream = await create_http_stream(
+                    session,
+                    url=http_url,
+                    name=analysis.get("file_name") or event_title,
+                    media_id=media.id,
+                    source="telegram_bot",
+                    size=analysis.get("file_size"),
+                    format=analysis.get("content_type"),
+                    uploader=uploader_name,
+                    uploader_user_id=uploader_user_id,
+                    is_public=auto_approved,
+                    resolution=overrides.get("resolution") or analysis.get("resolution"),
+                    quality=overrides.get("quality") or analysis.get("quality"),
+                    codec=overrides.get("codec") or analysis.get("codec"),
+                )
+                if language_refs:
+                    await add_languages_to_stream(session, http_stream.stream_id, [lang.id for lang in language_refs])
+            elif content_type == ContentType.ACESTREAM:
+                if not ace_content_id:
+                    return {"success": False, "error": "No AceStream content ID."}
+                acestream = await create_acestream_stream(
+                    session,
+                    content_id=ace_content_id,
+                    name=event_title,
+                    media_id=media.id,
+                    source="telegram_bot",
+                    uploader=uploader_name,
+                    uploader_user_id=uploader_user_id,
+                    is_public=auto_approved,
+                    resolution=overrides.get("resolution") or analysis.get("resolution"),
+                )
+                if language_refs:
+                    await add_languages_to_stream(session, acestream.stream_id, [lang.id for lang in language_refs])
+            elif content_type == ContentType.YOUTUBE:
+                if not youtube_video_id:
+                    return {"success": False, "error": "No YouTube video ID."}
+                yt_stream = await create_youtube_stream(
+                    session,
+                    video_id=youtube_video_id,
+                    name=analysis.get("title") or event_title,
+                    media_id=media.id,
+                    source="telegram_bot",
+                    is_live=analysis.get("is_live", False),
+                    uploader=uploader_name,
+                    uploader_user_id=uploader_user_id,
+                    is_public=auto_approved,
+                    resolution=overrides.get("resolution") or analysis.get("resolution"),
+                )
+                if language_refs:
+                    await add_languages_to_stream(session, yt_stream.stream_id, [lang.id for lang in language_refs])
+            elif content_type == ContentType.NZB:
+                if not nzb_url or not nzb_guid:
+                    return {"success": False, "error": "No NZB URL provided."}
+                await create_usenet_stream(
+                    session,
+                    nzb_guid=nzb_guid,
+                    name=analysis.get("nzb_name") or event_title,
+                    size=0,
+                    indexer="telegram_bot",
+                    media_id=media.id,
+                    nzb_url=nzb_url,
+                    resolution=overrides.get("resolution") or analysis.get("resolution"),
+                    quality=overrides.get("quality") or analysis.get("quality"),
+                    codec=overrides.get("codec") or analysis.get("codec"),
+                    uploader=uploader_name,
+                    uploader_user_id=uploader_user_id,
+                    is_public=auto_approved,
+                    languages=language_refs,
+                )
+
+            await session.commit()
+
+        return {"success": True, "auto_approved": auto_approved}
+
+    async def handle_cancel(self, user_id: int, chat_id: int, message_id: int) -> dict:
+        """Handle cancel action.
+
+        Args:
+            user_id: Telegram user ID
+            chat_id: Chat ID
+            message_id: Message ID to edit
+
+        Returns:
+            Dict with result
+        """
+        state = self.get_conversation(user_id)
+        batch_item_id = state.batch_item_id if state else None
+        self.clear_conversation(user_id)
+        if batch_item_id:
+            await self.finish_batch_item_review(user_id, batch_item_id, success=False)
+            await self.edit_message(chat_id, message_id, "↩️ *Returned to batch.*")
+        else:
+            await self.edit_message(chat_id, message_id, "❌ *Cancelled*\n\nOperation cancelled.")
+        return {"success": True}
+
+    async def handle_back(self, user_id: int, chat_id: int, message_id: int) -> dict:
+        """Handle back action to go to previous step.
+
+        Args:
+            user_id: Telegram user ID
+            chat_id: Chat ID
+            message_id: Message ID to edit
+
+        Returns:
+            Dict with result
+        """
+        state = self.get_conversation(user_id)
+        if not state:
+            return {"success": False, "message": "Session expired."}
+
+        current_step = state.step
+
+        if current_step == ConversationStep.AWAITING_METADATA_REVIEW:
+            if state.media_type == "sports":
+                # Go back to sports category selection
+                return await self.show_sports_category_picker(state, chat_id, message_id)
+            else:
+                # Go back to match selection
+                return await self.show_matches(state, chat_id, message_id)
+        elif current_step in (
+            ConversationStep.AWAITING_FIELD_EDIT,
+            ConversationStep.AWAITING_POSTER_INPUT,
+            ConversationStep.AWAITING_EPISODE_INPUT,
+            ConversationStep.AWAITING_ANONYMOUS_NAME,
+        ):
+            # Go back to metadata review
+            state.step = ConversationStep.AWAITING_METADATA_REVIEW
+            return await self.show_metadata_review(state, chat_id, message_id)
+        elif current_step in (ConversationStep.AWAITING_MATCH, ConversationStep.AWAITING_SPORTS_CATEGORY):
+            # Go back to media type selection
+            state.step = ConversationStep.AWAITING_MEDIA_TYPE
+            emoji = self.get_content_type_emoji(state.content_type)
+            type_name = self.get_content_type_name(state.content_type)
+            preview = self._get_content_preview(state.content_type, state.raw_input)
+            message = f"{emoji} *{type_name} Detected*\n\n{preview}\n\nSelect the content type:"
+            keyboard = self._build_media_type_keyboard(user_id)
+            await self.edit_message(chat_id, message_id, message, {"inline_keyboard": keyboard})
+            return {"success": True}
+        else:
+            # Can't go back further
+            return await self.handle_cancel(user_id, chat_id, message_id)
+
+    # ============================================
+    # Bot Commands Registration
+    # ============================================
+
+    async def register_bot_commands(self) -> bool:
+        """Register bot commands with Telegram.
+
+        This sets up the command menu that appears in Telegram.
+
+        Returns:
+            True if successful
+        """
+        if not self.enabled:
+            return False
+
+        commands = [
+            {"command": "start", "description": "Welcome message and quick start guide"},
+            {"command": "help", "description": "Show help and supported content types"},
+            {"command": "login", "description": "Link your Telegram account to MediaFusion"},
+            {"command": "status", "description": "Check your account status"},
+            {"command": "cancel", "description": "Cancel current operation"},
+            {"command": "scrape", "description": "Scrape a public Telegram channel (@channel or t.me link)"},
+        ]
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.base_url}/setMyCommands",
+                    json={"commands": commands},
+                ) as response:
+                    if response.ok:
+                        logger.info("Successfully registered bot commands")
+                        return True
+                    else:
+                        error_data = await response.json()
+                        logger.error(f"Failed to register bot commands: {error_data}")
+                        return False
+        except Exception as e:
+            logger.error(f"Error registering bot commands: {e}")
+            return False
+
+    async def handle_status_command(self, telegram_user_id: int, _chat_id: int) -> dict:
+        """Handle /status command.
+
+        Args:
+            telegram_user_id: Telegram user ID
+            chat_id: Chat ID
+
+        Returns:
+            Dict with result message
+        """
+        is_linked, mf_user_id = await self.check_user_linked(telegram_user_id)
+
+        if is_linked:
+            # Get user details
+            async with get_async_session_context() as session:
+                user = await session.get(User, mf_user_id)
+                if user:
+                    username = user.username or user.email or f"User #{mf_user_id}"
+                    message = (
+                        f"✅ *Account Status*\n\n"
+                        f"*Status:* Linked\n"
+                        f"*Username:* {username}\n"
+                        f"*MediaFusion ID:* {mf_user_id}\n\n"
+                        f"You can contribute content by sending:\n"
+                        f"• Magnet links\n"
+                        f"• Torrent files\n"
+                        f"• YouTube URLs\n"
+                        f"• HTTP direct links\n"
+                        f"• Video files\n"
+                        f"• NZB URLs\n"
+                        f"• AceStream IDs"
+                    )
+                else:
+                    message = "✅ *Account Status*\n\n*Status:* Linked\n\nReady to contribute content!"
+        else:
+            message = (
+                "❌ *Account Status*\n\n"
+                "*Status:* Not Linked\n\n"
+                "Your Telegram account is not linked to MediaFusion.\n\n"
+                "Send `/login` to link your account and start contributing content."
+            )
+
+        return {"success": True, "message": message}
+
+    async def handle_cancel_command(self, user_id: int, _chat_id: int) -> dict:
+        """Handle /cancel command.
+
+        Args:
+            user_id: Telegram user ID
+            chat_id: Chat ID
+
+        Returns:
+            Dict with result message
+        """
+        state = self.get_conversation(user_id)
+        if state:
+            batch_item_id = state.batch_item_id
+            self.clear_conversation(user_id)
+            if batch_item_id:
+                # Cancelled while reviewing a batch item — return to batch summary
+                await self.finish_batch_item_review(user_id, batch_item_id, success=False)
+                return {"success": True, "message": "↩️ *Returned to batch.*"}
+            return {
+                "success": True,
+                "message": "❌ *Operation Cancelled*\n\nYour current operation has been cancelled.",
+            }
+
+        batch = self.get_batch(user_id)
+        if batch:
+            self.clear_batch(user_id)
+            return {"success": True, "message": "❌ *Batch Cancelled*\n\nAll pending imports have been cancelled."}
+
+        return {"success": True, "message": "ℹ️ *No Active Operation*\n\nThere's nothing to cancel."}
+
+    def _scrape_job_key(self, user_id: int) -> str:
+        return f"telegram:scrape_job:{user_id}"
+
+    async def handle_scrape_command(self, user_id: int, chat_id: int, text: str) -> dict:
+        """Handle /scrape <channel> command.
+
+        Validates the channel identifier, guards against concurrent jobs, sends an
+        initial progress message, then enqueues scrape_telegram_channel_for_user.
+        """
+        parts = text.strip().split(None, 1)
+        raw_channel = parts[1].strip() if len(parts) > 1 else ""
+        channel = _normalize_telegram_channel_identifier(raw_channel)
+
+        if not channel:
+            return {
+                "success": False,
+                "message": (
+                    "⚠️ *Invalid Channel*\n\n"
+                    "Please provide a public channel username or link.\n\n"
+                    "*Examples:*\n"
+                    "`/scrape @channelname`\n"
+                    "`/scrape https://t.me/channelname`"
+                ),
+            }
+
+        is_linked, _ = await self.check_user_linked(user_id)
+        if not is_linked:
+            return {
+                "success": False,
+                "requires_login": True,
+                "message": (
+                    "🔐 *Account Required*\n\nLink your MediaFusion account first.\n\nSend `/login` to get started."
+                ),
+            }
+
+        job_key = self._scrape_job_key(user_id)
+        if await REDIS_ASYNC_CLIENT.exists(job_key):
+            return {
+                "success": False,
+                "message": (
+                    "⏳ *Scrape In Progress*\n\n"
+                    "You already have an active scraping job. "
+                    "Wait for it to finish or send `/cancel` to abort it."
+                ),
+            }
+
+        progress_message_id = await self._send_message_get_id(
+            chat_id,
+            f"🔍 *Starting Scrape*\n\nChannel: `{channel}`\n\n⏳ Initializing...",
+        )
+        if not progress_message_id:
+            return {
+                "success": False,
+                "message": "❌ Failed to send progress message. Please try again.",
+            }
+
+        from utils.telegram_tasks import scrape_telegram_channel_for_user  # noqa: PLC0415
+
+        asyncio.create_task(
+            scrape_telegram_channel_for_user(
+                user_id=user_id,
+                chat_id=chat_id,
+                progress_message_id=progress_message_id,
+                channel=channel,
+                notification_chat_id=settings.telegram_chat_id,
+            )
+        )
+        await REDIS_ASYNC_CLIENT.set(job_key, str(uuid.uuid4()), ex=_SCRAPE_JOB_TTL)
+
+        return {"success": True, "message": None}
+
+    async def get_file_info(self, file_id: str) -> dict | None:
+        """Get file information from Telegram Bot API.
+
+        Args:
+            file_id: Telegram file_id
+
+        Returns:
+            File info dict with file_path, or None if failed
+        """
+        if not self.enabled:
+            return None
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.base_url}/getFile",
+                    json={"file_id": file_id},
+                ) as response:
+                    data = await response.json()
+                    if data.get("ok"):
+                        return data.get("result")
+                    logger.error(f"Failed to get file info: {data}")
+                    return None
+        except Exception as e:
+            logger.error(f"Error getting file info: {e}")
+            return None
+
+    async def send_reply(
+        self,
+        chat_id: int,
+        message: str,
+        reply_to_message_id: int | None = None,
+        reply_markup: dict | None = None,
+    ):
+        """Send a reply message to a user.
+
+        Args:
+            chat_id: Telegram chat ID (usually same as user ID for DMs)
+            message: Message text
+            reply_to_message_id: Optional message ID to reply to
+            reply_markup: Optional inline keyboard markup
+
+        Returns:
+            True if message was sent successfully, False otherwise
+        """
+        if not self.enabled:
+            logger.warning("Telegram bot is not enabled. Cannot send reply.")
+            return False
+
+        try:
+            payload = {
+                "chat_id": chat_id,
+                "text": message,
+                "parse_mode": "Markdown",
+            }
+            if reply_to_message_id:
+                payload["reply_to_message_id"] = reply_to_message_id
+            if reply_markup:
+                payload["reply_markup"] = reply_markup
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.base_url}/sendMessage",
+                    json=payload,
+                ) as response:
+                    response_data = await response.json()
+                    if response.ok and response_data.get("ok"):
+                        logger.debug(f"Successfully sent Telegram message to chat {chat_id}")
+                        return True
+                    else:
+                        error_description = response_data.get("description", "Unknown error")
+                        logger.error(
+                            f"Failed to send Telegram reply to chat {chat_id}: "
+                            f"{error_description} (Status: {response.status})"
+                        )
+                        return False
+        except Exception as e:
+            logger.error(f"Error sending Telegram reply to chat {chat_id}: {e}", exc_info=True)
+            return False
+
+    async def edit_message(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        reply_markup: dict | None = None,
+    ):
+        """Edit an existing message.
+
+        Args:
+            chat_id: Telegram chat ID
+            message_id: Message ID to edit
+            text: New message text
+            reply_markup: Optional inline keyboard markup
+        """
+        if not self.enabled:
+            return
+
+        try:
+            payload = {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text,
+                "parse_mode": "Markdown",
+            }
+            if reply_markup:
+                payload["reply_markup"] = reply_markup
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.base_url}/editMessageText",
+                    json=payload,
+                ) as response:
+                    if not response.ok:
+                        error_data = await response.json()
+                        logger.error(f"Failed to edit message: {error_data}")
+        except Exception as e:
+            logger.error(f"Error editing message: {e}")
+
+    async def answer_callback_query(self, callback_query_id: str, text: str | None = None, show_alert: bool = False):
+        """Answer a callback query.
+
+        Args:
+            callback_query_id: Callback query ID
+            text: Optional text to show to user
+            show_alert: Whether to show as alert (modal) or notification
+        """
+        if not self.enabled:
+            return
+
+        try:
+            payload = {
+                "callback_query_id": callback_query_id,
+            }
+            if text:
+                payload["text"] = text
+            payload["show_alert"] = show_alert
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.base_url}/answerCallbackQuery",
+                    json=payload,
+                ) as response:
+                    if not response.ok:
+                        error_data = await response.json()
+                        logger.error(f"Failed to answer callback: {error_data}")
+        except Exception as e:
+            logger.error(f"Error answering callback: {e}")
+
+    async def send_video_to_user(
+        self,
+        chat_id: int,
+        file_id: str,
+        caption: str | None = None,
+    ) -> dict | None:
+        """Send a video to a user's DM using file_id for MediaFlow streaming access.
+
+        This uses the Telegram Bot API sendVideo method with a file_id to send
+        a video to the user. The file_id can be reused across chats, so we don't
+        need to know where the original message is - just the file_id.
+
+        Args:
+            chat_id: User's Telegram ID (bot DM chat_id)
+            file_id: Telegram file_id of the video to send
+            caption: Optional caption for the video
+
+        Returns:
+            Dict with {"message_id": new_message_id} on success, None on failure
+        """
+        if not self.enabled:
+            logger.warning("Telegram bot is not enabled. Cannot send video.")
+            return None
+
+        try:
+            payload = {
+                "chat_id": chat_id,
+                "video": file_id,
+            }
+            if caption:
+                payload["caption"] = caption
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.base_url}/sendVideo",
+                    json=payload,
+                ) as response:
+                    response_data = await response.json()
+                    if response.ok and response_data.get("ok"):
+                        result = response_data.get("result", {})
+                        new_message_id = result.get("message_id")
+                        logger.info(
+                            f"Successfully sent video (file_id={file_id[:20]}...) "
+                            f"to chat {chat_id}, message_id={new_message_id}"
+                        )
+                        return {"message_id": new_message_id}
+                    else:
+                        error_description = response_data.get("description", "Unknown error")
+                        logger.error(
+                            f"Failed to send video to {chat_id}: {error_description} (Status: {response.status})"
+                        )
+                        return None
+        except Exception as e:
+            logger.error(f"Error sending video to {chat_id}: {e}", exc_info=True)
+            return None
+
+    async def process_forwarded_video(
+        self,
+        user_id: int,
+        chat_id: int,
+        message_id: int,
+        file_id: str,
+        file_unique_id: str | None,
+        file_name: str | None,
+        file_size: int | None,
+        mime_type: str | None,
+        caption: str | None = None,
+    ) -> dict:
+        """Process a video forwarded by a user.
+
+        This method:
+        1. Validates the file (size, type)
+        2. Parses the filename for metadata
+        3. Automatically searches for matching media
+        4. Shows interactive search results with buttons
+
+        Args:
+            user_id: Telegram user ID
+            chat_id: Chat ID (same as user_id for DMs)
+            message_id: Message ID containing the video
+            file_id: Telegram file_id (bot-specific)
+            file_unique_id: Universal file identifier (same across all bots)
+            file_name: Original filename
+            file_size: File size in bytes
+            mime_type: MIME type
+            caption: Message caption (may contain IMDb ID)
+
+        Returns:
+            Dict with processing result
+        """
+        result = {
+            "success": False,
+            "message": "",
+            "file_id": file_id,
+            "file_unique_id": file_unique_id,
+            "needs_linking": True,
+            "meta_id": None,
+            "search_results": None,
+            "reply_markup": None,
+        }
+
+        # Validate file size (minimum 25MB by default)
+        min_size = settings.min_scraping_video_size
+        if file_size and file_size < min_size:
+            result["message"] = f"File too small (min {min_size // (1024 * 1024)} MB)"
+            return result
+
+        # Check for IMDb ID in caption first
+        imdb_pattern = re.compile(r"tt\d{7,8}")
+        imdb_match = imdb_pattern.search(caption or "")
+        if imdb_match:
+            result["meta_id"] = imdb_match.group(0)
+            result["needs_linking"] = False
+            result["message"] = f"✅ Video received and matched to {result['meta_id']}. Processing..."
+            # Store and process immediately
+            content_info = {
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "file_id": file_id,
+                "file_unique_id": file_unique_id,
+                "file_name": file_name or f"video_{message_id}",
+                "file_size": file_size,
+                "mime_type": mime_type,
+                "caption": caption,
+                "meta_id": result["meta_id"],
+                "needs_linking": False,
+                "timestamp": datetime.now().isoformat(),
+            }
+            pending = self._get_pending_content(user_id)
+            pending.append(content_info)
+            self._set_pending_content(user_id, pending)
+            result["success"] = True
+            return result
+
+        # Parse filename for metadata
+        search_title = None
+        search_year = None
+        media_type = None
+
+        if file_name:
+            try:
+                parsed = PTT.parse_title(file_name, True)
+                search_title = parsed.get("title")
+                search_year = parsed.get("year")
+                # Determine media type from parsed data
+                if parsed.get("seasons") or parsed.get("episodes"):
+                    media_type = "series"
+                else:
+                    media_type = "movie"
+            except Exception as e:
+                logger.debug(f"Error parsing filename {file_name}: {e}")
+
+        # Also check caption for title/year
+        if caption and not search_title:
+            # Try to extract title from caption
+            caption_lines = caption.split("\n")
+            for line in caption_lines:
+                line = line.strip()
+                if line and not imdb_pattern.search(line):
+                    search_title = line[:100]  # Limit length
+                    break
+
+        # If we have a title, search for matches
+        if search_title:
+            try:
+                logger.info(f"Searching IMDb for: {search_title} ({search_year})")
+                search_results = await search_multiple_imdb(
+                    title=search_title,
+                    limit=5,
+                    year=search_year,
+                    media_type=media_type,
+                    min_similarity=60,
+                )
+
+                if search_results:
+                    result["search_results"] = search_results
+                    # Create interactive keyboard
+                    keyboard = []
+                    for idx, match in enumerate(search_results[:5], 1):
+                        imdb_id = match.get("imdb_id", "")
+                        title = match.get("title", "Unknown")
+                        year = match.get("year", "")
+                        type_str = "🎬" if match.get("type") == "movie" else "📺"
+                        button_text = f"{idx}. {type_str} {title}"
+                        if year:
+                            button_text += f" ({year})"
+                        # Truncate if too long (Telegram limit is 64 chars)
+                        if len(button_text) > 60:
+                            button_text = button_text[:57] + "..."
+
+                        callback_data = f"select:{user_id}:{message_id}:{imdb_id}"
+                        keyboard.append([{"text": button_text, "callback_data": callback_data}])
+                        # Store search result in Redis for callback (shared across all workers)
+                        self._set_search_result(
+                            callback_data,
+                            {
+                                "user_id": user_id,
+                                "message_id": message_id,
+                                "file_id": file_id,
+                                "file_unique_id": file_unique_id,
+                                "file_name": file_name,
+                                "file_size": file_size,
+                                "mime_type": mime_type,
+                                "caption": caption,
+                                "imdb_id": imdb_id,
+                                "title": title,
+                                "year": year,
+                            },
+                        )
+
+                    # Add search, manual entry, and cancel buttons
+                    keyboard.append(
+                        [{"text": "🔍 Search by title", "callback_data": f"search_title:{user_id}:{message_id}"}]
+                    )
+                    keyboard.append(
+                        [{"text": "✏️ Enter IMDb ID manually", "callback_data": f"manual:{user_id}:{message_id}"}]
+                    )
+                    keyboard.append([{"text": "❌ Cancel", "callback_data": f"cancel:{user_id}:{message_id}"}])
+
+                    result["reply_markup"] = {"inline_keyboard": keyboard}
+                    result["message"] = (
+                        f"📹 *Video Received*\n\n"
+                        f"*File:* `{file_name or 'unnamed'}`\n"
+                        f"*Size:* {file_size // (1024 * 1024) if file_size else 'Unknown'} MB\n\n"
+                        f"🔍 *Found {len(search_results)} possible match(es):*\n\n"
+                        f"Select a match or enter IMDb ID manually:"
+                    )
+                else:
+                    # No matches found, offer search by title or manual entry
+                    keyboard = [
+                        [{"text": "🔍 Search by title", "callback_data": f"search_title:{user_id}:{message_id}"}],
+                        [{"text": "✏️ Enter IMDb ID", "callback_data": f"manual:{user_id}:{message_id}"}],
+                        [{"text": "❌ Cancel", "callback_data": f"cancel:{user_id}:{message_id}"}],
+                    ]
+                    result["reply_markup"] = {"inline_keyboard": keyboard}
+                    result["message"] = (
+                        f"📹 *Video Received*\n\n"
+                        f"*File:* `{file_name or 'unnamed'}`\n"
+                        f"*Size:* {file_size // (1024 * 1024) if file_size else 'Unknown'} MB\n\n"
+                        f"❌ No automatic matches found.\n"
+                        f"Please select an option:"
+                    )
+            except Exception as e:
+                logger.exception(f"Error searching for matches: {e}")
+                keyboard = [
+                    [{"text": "🔍 Search by title", "callback_data": f"search_title:{user_id}:{message_id}"}],
+                    [{"text": "✏️ Enter IMDb ID", "callback_data": f"manual:{user_id}:{message_id}"}],
+                    [{"text": "❌ Cancel", "callback_data": f"cancel:{user_id}:{message_id}"}],
+                ]
+                result["reply_markup"] = {"inline_keyboard": keyboard}
+                result["message"] = (
+                    f"📹 *Video Received*\n\n"
+                    f"*File:* `{file_name or 'unnamed'}`\n"
+                    f"*Size:* {file_size // (1024 * 1024) if file_size else 'Unknown'} MB\n\n"
+                    f"Please select an option:"
+                )
+        else:
+            # No title to search, offer search by title or manual entry
+            keyboard = [
+                [{"text": "🔍 Search by title", "callback_data": f"search_title:{user_id}:{message_id}"}],
+                [{"text": "✏️ Enter IMDb ID", "callback_data": f"manual:{user_id}:{message_id}"}],
+                [{"text": "❌ Cancel", "callback_data": f"cancel:{user_id}:{message_id}"}],
+            ]
+            result["reply_markup"] = {"inline_keyboard": keyboard}
+            result["message"] = (
+                f"📹 *Video Received*\n\n"
+                f"*File:* `{file_name or 'unnamed'}`\n"
+                f"*Size:* {file_size // (1024 * 1024) if file_size else 'Unknown'} MB\n\n"
+                f"Please select an option:"
+            )
+
+        # Store content info for later processing (ALWAYS store, even if we have search results)
+        content_info = {
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "message_id": message_id,  # This is the original video message ID
+            "file_id": file_id,
+            "file_unique_id": file_unique_id,
+            "file_name": file_name or f"video_{message_id}",
+            "file_size": file_size,
+            "mime_type": mime_type,
+            "caption": caption,
+            "meta_id": None,
+            "needs_linking": True,
+            "timestamp": datetime.now().isoformat(),
+        }
+
+        # Add to pending content queue (replace if exists for same message_id)
+        pending = [p for p in self._get_pending_content(user_id) if p.get("message_id") != message_id]
+        pending.append(content_info)
+        self._set_pending_content(user_id, pending)
+
+        # Also update search_results in Redis with file info for all callbacks for this message
+        # This ensures we can find it even if pending_content is cleared
+        try:
+            pattern = f"telegram:search_result:select:{user_id}:{message_id}:*"
+            matching_keys = REDIS_SYNC_CLIENT.keys(pattern) or []
+            for raw_key in matching_keys:
+                key_str = raw_key.decode("utf-8") if isinstance(raw_key, bytes) else raw_key
+                raw_data = REDIS_SYNC_CLIENT.get(key_str)
+                if raw_data:
+                    data = json.loads(raw_data)
+                    data.update(
+                        {
+                            "chat_id": chat_id,
+                            "file_id": file_id,
+                            "file_unique_id": file_unique_id,
+                            "file_name": file_name,
+                            "file_size": file_size,
+                            "mime_type": mime_type,
+                            "caption": caption,
+                        }
+                    )
+                    REDIS_SYNC_CLIENT.setex(key_str, 30 * 60, json.dumps(data))
+        except Exception as e:
+            logger.debug(f"Failed to update search results in Redis for message {message_id}: {e}")
+
+        result["success"] = True
+        return result
+
+    async def link_pending_content(
+        self,
+        user_id: int,
+        meta_id: str,
+    ) -> dict:
+        """Link pending content to a media item.
+
+        Args:
+            user_id: Telegram user ID
+            meta_id: IMDb ID or other external ID to link to
+
+        Returns:
+            Dict with result
+        """
+        pending = self._get_pending_content(user_id)
+        if not pending:
+            return {
+                "success": False,
+                "message": "No pending content to link. Please forward a video first.",
+            }
+
+        # Get the most recent pending content and save the updated list immediately
+        content = pending.pop()
+        self._set_pending_content(user_id, pending)
+        content["meta_id"] = meta_id
+        content["needs_linking"] = False
+
+        # Store the stream
+        try:
+            stored = await self._store_forwarded_content(content)
+            if stored:
+                return {
+                    "success": True,
+                    "message": f"Content linked to {meta_id} and stored successfully!",
+                }
+            else:
+                # Put it back in the queue
+                pending.append(content)
+                self._set_pending_content(user_id, pending)
+                return {
+                    "success": False,
+                    "message": "Failed to store content. Please try again.",
+                }
+        except Exception as e:
+            logger.exception(f"Error storing forwarded content: {e}")
+            pending.append(content)
+            self._set_pending_content(user_id, pending)
+            return {
+                "success": False,
+                "message": f"Error: {str(e)}",
+            }
+
+    async def _get_mediafusion_user_id(self, telegram_user_id: int) -> int | None:
+        """Get MediaFusion user ID for a Telegram user ID.
+
+        Args:
+            telegram_user_id: Telegram user ID
+
+        Returns:
+            MediaFusion user ID if linked, None otherwise
+        """
+        # Check Redis cache first (shared across all workers)
+        try:
+            cached = REDIS_SYNC_CLIENT.get(self._user_mapping_key(telegram_user_id))
+            if cached:
+                return int(cached)
+        except Exception as e:
+            logger.debug(f"Failed to read user mapping from Redis for {telegram_user_id}: {e}")
+
+        # Check database for linked user (at user level, not profile level)
+        async with get_async_session_context() as session:
+            # Search in users table for telegram_user_id
+            query = select(User).where(User.telegram_user_id == str(telegram_user_id))
+            result = await session.exec(query)
+            user = result.first()
+
+            if user:
+                try:
+                    REDIS_SYNC_CLIENT.setex(self._user_mapping_key(telegram_user_id), 3600, str(user.id))
+                except Exception as e:
+                    logger.debug(f"Failed to cache user mapping in Redis: {e}")
+                return user.id
+
+        return None
+
+    async def _store_forwarded_content(self, content: dict) -> bool:
+        """Store forwarded content as a Telegram stream.
+
+        Also forwards to backup channel if configured for redundancy.
+
+        Args:
+            content: Content info dict
+
+        Returns:
+            True if stored successfully
+        """
+        meta_id = content.get("meta_id")
+        if not meta_id:
+            logger.warning("No meta_id provided in content")
+            return False
+
+        async with get_async_session_context() as session:
+            is_public = bool(content.get("is_public", True))
+            # Resolve media ID
+            media = await crud.get_media_by_external_id(session, meta_id)
+            if not media:
+                logger.warning(f"Media not found for meta_id: {meta_id}. Make sure the media exists in the database.")
+                return False
+
+            # Check if stream already exists by file_unique_id (preferred) or file_id
+            file_unique_id = content.get("file_unique_id")
+            file_id = content.get("file_id")
+
+            if file_unique_id:
+                existing = await crud.get_telegram_stream_by_file_unique_id(session, file_unique_id)
+                if existing:
+                    if is_public:
+                        stream = await session.get(Stream, existing.stream_id)
+                        if stream and not stream.is_public:
+                            stream.is_public = True
+                            await session.commit()
+                    logger.info(f"Telegram stream already exists (file_unique_id: {file_unique_id})")
+                    return True
+            elif file_id:
+                existing = await crud.get_telegram_stream_by_file_id(session, file_id)
+                if existing:
+                    if is_public:
+                        stream = await session.get(Stream, existing.stream_id)
+                        if stream and not stream.is_public:
+                            stream.is_public = True
+                            await session.commit()
+                    logger.info(f"Telegram stream already exists (file_id: {file_id[:20]}...)")
+                    return True
+
+            # Parse filename for quality attributes
+            parsed = PTT.parse_title(content["file_name"], True)
+            selected_languages = self._normalize_language_values(
+                content.get("languages")
+            ) or self._normalize_language_values(parsed.get("languages"))
+
+            # Get MediaFusion user ID if linked
+            mf_user_id = await self._get_mediafusion_user_id(content["user_id"])
+
+            # Determine uploader name and user_id with anonymity preference.
+            uploader_name = None
+            uploader_user_id = None
+
+            if mf_user_id:
+                uploader_name, uploader_user_id, _ = await self._resolve_telegram_uploader(
+                    session,
+                    mf_user_id,
+                    content.get("anonymous_display_name"),
+                )
+            else:
+                # Unlinked user - use Telegram user ID (masked)
+                telegram_id_str = str(content["user_id"])
+                masked_id = telegram_id_str[:4] + "xxxx" if len(telegram_id_str) > 4 else "xxxx"
+                uploader_name = f"Telegram User {masked_id}"
+
+            # Forward to backup channel if configured
+            # For bot contributions, the backup channel becomes the canonical location
+            # (we don't store contributor's chat_id/message_id since we use file_id for playback)
+            backup_chat_id = None
+            backup_message_id = None
+
+            if settings.telegram_backup_channel_id and content.get("file_id"):
+                backup_result = await self._forward_to_backup_channel(
+                    file_id=content["file_id"],
+                    file_name=content["file_name"],
+                    meta_id=meta_id,
+                    media_title=media.title,
+                )
+                if backup_result:
+                    backup_chat_id = backup_result.get("chat_id")
+                    backup_message_id = backup_result.get("message_id")
+                    logger.info(f"Forwarded to backup channel: {backup_chat_id}/{backup_message_id}")
+
+            # For bot contributions:
+            # - Use backup channel as primary location if available
+            # - Otherwise use a placeholder (file_id is what matters for playback)
+            # We don't store contributor's DM chat_id/message_id since:
+            # 1. Playback uses file_id via sendVideo, not chat location
+            # 2. Contributor's user info is stored via uploader_user_id
+            primary_chat_id = backup_chat_id or "bot_contribution"
+            primary_message_id = backup_message_id or 0
+
+            # Resolve episode info: prefer explicit values from wizard, fall back to filename parse
+            season_number = content.get("season_number")
+            episode_number = content.get("episode_number")
+            episode_end = content.get("episode_end")
+            if season_number is None and parsed.get("seasons"):
+                season_number = parsed["seasons"][0]
+            if episode_number is None and parsed.get("episodes"):
+                episode_number = parsed["episodes"][0]
+                if episode_end is None and len(parsed["episodes"]) > 1:
+                    episode_end = parsed["episodes"][-1]
+            language_refs = await self._resolve_language_refs(session, selected_languages)
+
+            await crud.create_telegram_stream(
+                session,
+                chat_id=primary_chat_id,
+                message_id=primary_message_id,
+                name=parsed.get("title", content["file_name"]),
+                media_id=media.id,
+                file_id=content["file_id"],
+                file_unique_id=content.get("file_unique_id"),
+                file_name=content["file_name"],
+                mime_type=content["mime_type"],
+                size=content["file_size"],
+                backup_chat_id=backup_chat_id,
+                backup_message_id=backup_message_id,
+                source="telegram_bot",
+                uploader=uploader_name,
+                uploader_user_id=uploader_user_id,
+                is_public=is_public,
+                resolution=content.get("resolution") or parsed.get("resolution"),
+                codec=content.get("codec") or parsed.get("codec"),
+                quality=content.get("quality") or parsed.get("quality"),
+                release_group=parsed.get("group"),
+                languages=language_refs,
+                season_number=season_number,
+                episode_number=episode_number,
+                episode_end=episode_end,
+            )
+
+            await session.commit()
+            logger.info(f"Stored Telegram stream: {content['file_name']} -> {meta_id}")
+
+            # Notify admin channel
+            await telegram_notifier.send_content_received_notification(
+                file_name=content["file_name"],
+                file_size=content["file_size"],
+                status="stored",
+                meta_id=meta_id,
+                title=media.title,
+            )
+
+            return True
+
+    async def _forward_to_backup_channel(
+        self,
+        file_id: str,
+        file_name: str,
+        meta_id: str,
+        media_title: str,
+    ) -> dict | None:
+        """Forward video to backup channel for redundancy.
+
+        Uses sendVideo with file_id to copy the video to the backup channel.
+        This ensures content survives even if the original contributor deletes
+        their message or the bot gets suspended (with file_unique_id matching).
+
+        Args:
+            file_id: Telegram file_id of the video
+            file_name: Original filename
+            meta_id: IMDb/external ID for caption
+            media_title: Human-readable title
+
+        Returns:
+            Dict with {"chat_id": str, "message_id": int} on success, None on failure
+        """
+        if not self.enabled or not settings.telegram_backup_channel_id:
+            return None
+
+        try:
+            # Build informative caption for the backup
+            caption = f"📁 {file_name}\n🎬 {media_title}\n🔗 {meta_id}"
+            if len(caption) > 1024:  # Telegram caption limit
+                caption = caption[:1021] + "..."
+
+            payload = {
+                "chat_id": settings.telegram_backup_channel_id,
+                "video": file_id,
+                "caption": caption,
+            }
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.base_url}/sendVideo",
+                    json=payload,
+                ) as response:
+                    response_data = await response.json()
+                    if response.ok and response_data.get("ok"):
+                        result = response_data.get("result", {})
+                        message_id = result.get("message_id")
+                        logger.info(f"Forwarded to backup channel: {settings.telegram_backup_channel_id}/{message_id}")
+                        return {
+                            "chat_id": settings.telegram_backup_channel_id,
+                            "message_id": message_id,
+                        }
+                    else:
+                        error_description = response_data.get("description", "Unknown error")
+                        logger.error(f"Failed to forward to backup channel: {error_description}")
+                        return None
+        except Exception as e:
+            logger.error(f"Error forwarding to backup channel: {e}", exc_info=True)
+            return None
+
+    def get_pending_count(self, user_id: int) -> int:
+        """Get count of pending content for a user."""
+        return len(self._get_pending_content(user_id))
+
+    def clear_pending(self, user_id: int):
+        """Clear pending content for a user."""
+        self._delete_pending_content(user_id)
+
+    async def handle_login_command(self, telegram_user_id: int, chat_id: int) -> dict:
+        """Handle /login command to link Telegram account to MediaFusion.
+
+        Args:
+            telegram_user_id: Telegram user ID
+            chat_id: Chat ID
+
+        Returns:
+            Dict with result message
+        """
+        # Security guard: never issue login tokens in group chats.
+        # In a private chat, Telegram chat_id == user_id for normal users.
+        if chat_id != telegram_user_id:
+            return {
+                "success": False,
+                "message": (
+                    "🔒 *Private Chat Required*\n\n"
+                    "For security, `/login` only works in a private chat.\n\n"
+                    "Please open a direct chat with this bot and send `/login` there."
+                ),
+            }
+
+        # Generate a secure login token
+        login_token = secrets.token_urlsafe(32)
+
+        login_data = {
+            "telegram_user_id": telegram_user_id,
+        }
+
+        # Store in Redis so all workers share the same token state
+        REDIS_SYNC_CLIENT.setex(
+            f"telegram:login_token:{login_token}",
+            24 * 60 * 60,  # 24 hours in seconds
+            json.dumps(login_data),
+        )
+
+        # Use frontend URL for better UX - redirects to login if not authenticated
+        login_url = f"{settings.host_url}/app/telegram/login?token={login_token}"
+
+        message = (
+            "🔐 *Link Your MediaFusion Account*\n\n"
+            "To link your Telegram account to MediaFusion:\n\n"
+            f"1. Click this link: [Login to MediaFusion]({login_url})\n"
+            "2. Sign in to your MediaFusion account\n"
+            "3. Your Telegram account will be linked automatically\n\n"
+            f"*Login Token:* `{login_token}`\n"
+            "*Expires in:* 24 hours\n\n"
+            "After linking, your uploaded content will be stored with your MediaFusion account."
+        )
+
+        return {"success": True, "message": message}
+
+    async def link_telegram_user(
+        self,
+        login_token: str,
+        mediafusion_user_id: int,
+        replace_existing: bool = False,
+    ) -> dict:
+        """Link Telegram user to MediaFusion user account.
+
+        Args:
+            login_token: Login token from /login command
+            mediafusion_user_id: MediaFusion user ID
+            replace_existing: If True, transfer an existing Telegram link from another user
+
+        Returns:
+            Dict with result
+        """
+        # Retrieve token data from Redis (shared across all workers)
+        raw = REDIS_SYNC_CLIENT.get(f"telegram:login_token:{login_token}")
+        if not raw:
+            return {"success": False, "message": "Invalid login token"}
+
+        login_data = json.loads(raw)
+        telegram_user_id = login_data["telegram_user_id"]
+
+        previous_telegram_user_id: str | None = None
+
+        # Store mapping at user level (not profile level)
+        async with get_async_session_context() as session:
+            # Get the user
+            query = select(User).where(User.id == mediafusion_user_id)
+            result = await session.exec(query)
+            user = result.first()
+
+            if not user:
+                REDIS_SYNC_CLIENT.delete(f"telegram:login_token:{login_token}")
+                return {"success": False, "message": "User not found"}
+
+            telegram_user_id_str = str(telegram_user_id)
+            previous_telegram_user_id = user.telegram_user_id
+
+            # If this Telegram account is already linked to another MediaFusion user,
+            # require explicit confirmation before transferring ownership.
+            conflicting_user_query = select(User).where(
+                User.telegram_user_id == telegram_user_id_str,
+                User.id != mediafusion_user_id,
+            )
+            conflicting_user_result = await session.exec(conflicting_user_query)
+            conflicting_user = conflicting_user_result.first()
+
+            if conflicting_user and not replace_existing:
+                return {
+                    "success": False,
+                    "requires_confirmation": True,
+                    "message": (
+                        "This Telegram account is already linked to another MediaFusion account. "
+                        "Do you want to replace the existing link and continue?"
+                    ),
+                }
+
+            if conflicting_user and replace_existing:
+                conflicting_user.telegram_user_id = None
+                conflicting_user.telegram_linked_at = None
+                session.add(conflicting_user)
+
+            # Update user with Telegram linking info
+            user.telegram_user_id = telegram_user_id_str
+            user.telegram_linked_at = datetime.now(pytz.UTC)
+
+            session.add(user)
+            try:
+                await session.commit()
+            except IntegrityError as exc:
+                await session.rollback()
+                logger.warning(
+                    "Telegram link conflict for telegram_user_id=%s mediafusion_user_id=%s: %s",
+                    telegram_user_id,
+                    mediafusion_user_id,
+                    exc,
+                )
+                return {
+                    "success": False,
+                    "requires_confirmation": True,
+                    "message": (
+                        "This Telegram account is already linked to another MediaFusion account. "
+                        "Please confirm replacement and try again."
+                    ),
+                }
+
+        # Update Redis cache
+        try:
+            REDIS_SYNC_CLIENT.setex(self._user_mapping_key(telegram_user_id), 3600, str(mediafusion_user_id))
+        except Exception as e:
+            logger.debug(f"Failed to update user mapping cache in Redis: {e}")
+
+        # Remove stale mapping if user switched from a different Telegram account
+        if previous_telegram_user_id and previous_telegram_user_id != str(telegram_user_id):
+            try:
+                REDIS_SYNC_CLIENT.delete(self._user_mapping_key(int(previous_telegram_user_id)))
+            except (ValueError, TypeError):
+                logger.debug(
+                    "Skipping stale Telegram mapping cleanup for non-numeric id %s",
+                    previous_telegram_user_id,
+                )
+            except Exception as e:
+                logger.debug(f"Failed to clear stale user mapping cache in Redis: {e}")
+
+        # Get user details for notification
+        async with get_async_session_context() as session:
+            user_query = select(User).where(User.id == mediafusion_user_id)
+            user_result = await session.exec(user_query)
+            user = user_result.first()
+
+        # Send notification to Telegram user
+        try:
+            if not self.enabled:
+                logger.warning("Telegram bot is not enabled. Cannot send linking notification.")
+            else:
+                user_display_name = (
+                    user.username
+                    if user and user.username
+                    else (user.email.split("@")[0] if user and user.email else f"User {mediafusion_user_id}")
+                )
+                notification_message = (
+                    f"✅ *Account Linked Successfully!*\n\n"
+                    f"👋 *Welcome, {user_display_name}!*\n\n"
+                    f"Your Telegram account has been linked to your MediaFusion account:\n"
+                    f"*Username:* {user_display_name}\n"
+                    f"*Email:* {user.email if user and user.email else 'N/A'}\n\n"
+                    f"🎬 *What's Next?*\n"
+                    f"• Forward videos to me and they'll be stored with your account\n"
+                    f"• Your uploaded content will show your name as the uploader\n"
+                    f"• Manage your Telegram channels in MediaFusion profile settings\n\n"
+                    f"Ready to add content? Just forward a video file! 🚀\n\n"
+                    f"Type `/help` for more information or `/start` to see the welcome message."
+                )
+                success = await self.send_reply(telegram_user_id, notification_message)
+                if success:
+                    logger.info(f"Successfully sent Telegram linking notification to user {telegram_user_id}")
+                else:
+                    logger.warning(f"Failed to send Telegram linking notification to user {telegram_user_id}")
+        except Exception as e:
+            logger.error(f"Failed to send Telegram notification after linking: {e}", exc_info=True)
+
+        # Clean up login token from Redis
+        REDIS_SYNC_CLIENT.delete(f"telegram:login_token:{login_token}")
+
+        return {
+            "success": True,
+            "message": f"Telegram account linked successfully to MediaFusion user {mediafusion_user_id}",
+        }
+
+    async def unlink_telegram_user(self, mediafusion_user_id: int) -> dict:
+        """Unlink Telegram user from a MediaFusion user account."""
+        telegram_user_id: str | None = None
+
+        async with get_async_session_context() as session:
+            query = select(User).where(User.id == mediafusion_user_id)
+            result = await session.exec(query)
+            user = result.first()
+
+            if not user:
+                return {"success": False, "message": "User not found"}
+
+            if not user.telegram_user_id:
+                return {"success": True, "message": "Telegram account is already unlinked"}
+
+            telegram_user_id = user.telegram_user_id
+            user.telegram_user_id = None
+            user.telegram_linked_at = None
+
+            session.add(user)
+            await session.commit()
+
+        if telegram_user_id:
+            try:
+                REDIS_SYNC_CLIENT.delete(self._user_mapping_key(int(telegram_user_id)))
+            except (ValueError, TypeError):
+                logger.debug("Skipping Telegram mapping cleanup for non-numeric id %s", telegram_user_id)
+            except Exception as e:
+                logger.debug(f"Failed to clear Telegram mapping cache in Redis: {e}")
+
+        return {"success": True, "message": "Telegram account unlinked successfully"}
+
+    async def handle_callback_query(
+        self,
+        callback_query_id: str,
+        user_id: int,
+        chat_id: int,
+        message_id: int,
+        callback_data: str,
+    ) -> dict:
+        """Handle callback query from inline keyboard buttons.
+
+        Supports both new wizard flow callbacks and legacy callbacks for backward compatibility.
+
+        New callback prefixes:
+        - mtype:{user_id}:{media_type} - Media type selection (movie/series/sports)
+        - match:{user_id}:{external_id} - Match selection (external_id may contain colons)
+        - sport:{user_id}:{category_key} - Sports category selection
+        - manual:{user_id} - Manual external ID entry
+        - meta_edit:{user_id}:{field} - Open field editor
+        - meta_val:{user_id}:{field}:{value} - Set field value
+        - confirm:{user_id} - Confirm import
+        - cancel:{user_id} - Cancel operation
+        - back:{user_id} - Go back one step
+        - back_review:{user_id} - Go back to review from field editor
+
+        Legacy callbacks (for backward compatibility):
+        - select:{user_id}:{msg_id}:{imdb_id} - Legacy video match selection
+
+        Args:
+            callback_query_id: Callback query ID for answering
+            user_id: Telegram user ID
+            chat_id: Chat ID
+            message_id: Message ID containing the keyboard
+            callback_data: Callback data from button
+
+        Returns:
+            Dict with result
+        """
+        result = {"success": False, "message": "", "action": None}
+
+        try:
+            # Parse callback data
+            parts = callback_data.split(":")
+            action = parts[0] if parts else None
+
+            # ============================================
+            # NEW WIZARD FLOW CALLBACKS
+            # ============================================
+
+            if action == "mtype":
+                # Media type selection: mtype:{user_id}:{media_type}
+                if len(parts) >= 3:
+                    target_user_id = int(parts[1])
+                    media_type = parts[2]
+
+                    if target_user_id != user_id:
+                        await self.answer_callback_query(callback_query_id, "❌ Unauthorized", show_alert=True)
+                        return result
+
+                    await self.answer_callback_query(callback_query_id)
+                    await self.handle_media_type_selection(user_id, chat_id, message_id, media_type)
+                    result["success"] = True
+                    result["action"] = "media_type_selected"
+
+            elif action == "match":
+                # Match selection: match:{user_id}:{external_id}
+                # external_id may contain colons (e.g. tmdb:123), so rejoin parts
+                if len(parts) >= 3:
+                    target_user_id = int(parts[1])
+                    external_id = ":".join(parts[2:])
+
+                    if target_user_id != user_id:
+                        await self.answer_callback_query(callback_query_id, "❌ Unauthorized", show_alert=True)
+                        return result
+
+                    await self.answer_callback_query(callback_query_id)
+                    await self.handle_match_selection(user_id, chat_id, message_id, external_id)
+                    result["success"] = True
+                    result["action"] = "match_selected"
+
+            elif action == "sport":
+                # Sports category selection: sport:{user_id}:{category_key}
+                if len(parts) >= 3:
+                    target_user_id = int(parts[1])
+                    category_key = parts[2]
+
+                    if target_user_id != user_id:
+                        await self.answer_callback_query(callback_query_id, "❌ Unauthorized", show_alert=True)
+                        return result
+
+                    await self.answer_callback_query(callback_query_id)
+                    await self.handle_sports_category_selection(user_id, chat_id, message_id, category_key)
+                    result["success"] = True
+                    result["action"] = "sports_category_selected"
+
+            elif action == "search_title":
+                # Title search: search_title:{user_id} (wizard) or search_title:{user_id}:{msg_id} (legacy)
+                if len(parts) >= 2:
+                    target_user_id = int(parts[1])
+
+                    if target_user_id != user_id:
+                        await self.answer_callback_query(callback_query_id, "❌ Unauthorized", show_alert=True)
+                        return result
+
+                    await self.answer_callback_query(callback_query_id)
+
+                    state = self.get_conversation(user_id)
+                    if state:
+                        await self.handle_title_search_prompt(user_id, chat_id, message_id)
+                    else:
+                        # Legacy flow — create a temporary conversation to track the search step
+                        pending = self._get_pending_content(user_id)
+                        raw_input = pending[-1] if pending else {}
+                        state = self.create_conversation(
+                            user_id,
+                            chat_id,
+                            ContentType.VIDEO,
+                            raw_input,
+                            message_id,
+                        )
+                        state.step = ConversationStep.AWAITING_TITLE_SEARCH
+                        state.touch()
+                        self._persist_conversation(state)
+                        await self.edit_message(
+                            chat_id,
+                            message_id,
+                            "🔍 *Search by Title*\n\n"
+                            "Type the title of the movie or series you want to find.\n\n"
+                            "*Examples:*\n"
+                            "• `The Dark Knight`\n"
+                            "• `Breaking Bad`\n"
+                            "• `Inception 2010`",
+                            {
+                                "inline_keyboard": [
+                                    [{"text": "❌ Cancel", "callback_data": f"cancel:{user_id}"}],
+                                ]
+                            },
+                        )
+                    result["success"] = True
+                    result["action"] = "search_title"
+
+            elif action == "manual":
+                # Manual IMDb entry: manual:{user_id} (new) or manual:{user_id}:{msg_id} (legacy)
+                if len(parts) >= 2:
+                    target_user_id = int(parts[1])
+
+                    if target_user_id != user_id:
+                        await self.answer_callback_query(callback_query_id, "❌ Unauthorized", show_alert=True)
+                        return result
+
+                    await self.answer_callback_query(callback_query_id)
+
+                    # Check if this is from the new wizard flow
+                    state = self.get_conversation(user_id)
+                    if state:
+                        await self.handle_manual_imdb_input(user_id, chat_id, message_id)
+                    else:
+                        # Legacy behavior
+                        await self.edit_message(
+                            chat_id,
+                            message_id,
+                            "✏️ *Manual Entry*\n\nPlease reply with an external ID.\n\n"
+                            "*Examples:* `tt1234567`, `tmdb:12345`, `tvdb:12345`",
+                        )
+                    result["success"] = True
+                    result["action"] = "manual_entry"
+
+            elif action == "meta_edit":
+                # Field editor: meta_edit:{user_id}:{field}
+                if len(parts) >= 3:
+                    target_user_id = int(parts[1])
+                    field = parts[2]
+
+                    if target_user_id != user_id:
+                        await self.answer_callback_query(callback_query_id, "❌ Unauthorized", show_alert=True)
+                        return result
+
+                    await self.answer_callback_query(callback_query_id)
+                    await self.show_field_editor(user_id, chat_id, message_id, field)
+                    result["success"] = True
+                    result["action"] = "field_editor_shown"
+
+            elif action == "meta_val":
+                # Field value selection: meta_val:{user_id}:{field}:{value}
+                if len(parts) >= 4:
+                    target_user_id = int(parts[1])
+                    field = parts[2]
+                    value = ":".join(parts[3:])  # Value might contain colons
+
+                    if target_user_id != user_id:
+                        await self.answer_callback_query(callback_query_id, "❌ Unauthorized", show_alert=True)
+                        return result
+
+                    await self.answer_callback_query(callback_query_id, f"✓ {field}: {value}")
+                    await self.handle_field_value_selection(user_id, chat_id, message_id, field, value)
+                    result["success"] = True
+                    result["action"] = "field_value_set"
+
+            elif action == "confirm":
+                # Confirm import: confirm:{user_id}
+                if len(parts) >= 2:
+                    target_user_id = int(parts[1])
+
+                    if target_user_id != user_id:
+                        await self.answer_callback_query(callback_query_id, "❌ Unauthorized", show_alert=True)
+                        return result
+
+                    await self.answer_callback_query(callback_query_id)
+                    await self.handle_confirm_import(user_id, chat_id, message_id)
+                    result["success"] = True
+                    result["action"] = "import_executed"
+
+            elif action == "anon_skip":
+                # Skip custom anonymous name: anon_skip:{user_id}
+                if len(parts) >= 2:
+                    target_user_id = int(parts[1])
+
+                    if target_user_id != user_id:
+                        await self.answer_callback_query(callback_query_id, "❌ Unauthorized", show_alert=True)
+                        return result
+
+                    await self.answer_callback_query(callback_query_id, "Using default anonymous name")
+                    state = self.get_conversation(user_id)
+                    if state:
+                        state.anonymous_display_name = None
+                        state.touch()
+                        self._persist_conversation(state)
+                    await self.execute_import(user_id, chat_id, message_id)
+                    result["success"] = True
+                    result["action"] = "anonymous_name_skipped"
+
+            elif action == "cancel":
+                # Cancel: cancel:{user_id} (new) or cancel:{user_id}:{msg_id} (legacy)
+                if len(parts) >= 2:
+                    target_user_id = int(parts[1])
+
+                    if target_user_id != user_id:
+                        await self.answer_callback_query(callback_query_id, "❌ Unauthorized", show_alert=True)
+                        return result
+
+                    await self.answer_callback_query(callback_query_id)
+
+                    # Handle new wizard flow
+                    state = self.get_conversation(user_id)
+                    if state:
+                        await self.handle_cancel(user_id, chat_id, message_id)
+                    else:
+                        # Legacy behavior
+                        await self.edit_message(chat_id, message_id, "❌ *Cancelled*\n\nOperation cancelled.")
+                        # Remove pending content if msg_id provided
+                        if len(parts) >= 3:
+                            target_message_id = int(parts[2])
+                            pending = self._get_pending_content(user_id)
+                            updated = [p for p in pending if p.get("message_id") != target_message_id]
+                            if len(updated) != len(pending):
+                                self._set_pending_content(user_id, updated)
+
+                    result["success"] = True
+                    result["action"] = "cancelled"
+
+            elif action == "back":
+                # Back: back:{user_id}
+                if len(parts) >= 2:
+                    target_user_id = int(parts[1])
+
+                    if target_user_id != user_id:
+                        await self.answer_callback_query(callback_query_id, "❌ Unauthorized", show_alert=True)
+                        return result
+
+                    await self.answer_callback_query(callback_query_id)
+                    await self.handle_back(user_id, chat_id, message_id)
+                    result["success"] = True
+                    result["action"] = "back"
+
+            elif action == "back_review":
+                # Back to review from field editor: back_review:{user_id}
+                if len(parts) >= 2:
+                    target_user_id = int(parts[1])
+
+                    if target_user_id != user_id:
+                        await self.answer_callback_query(callback_query_id, "❌ Unauthorized", show_alert=True)
+                        return result
+
+                    await self.answer_callback_query(callback_query_id)
+                    state = self.get_conversation(user_id)
+                    if state:
+                        state.step = ConversationStep.AWAITING_METADATA_REVIEW
+                        await self.show_metadata_review(state, chat_id, message_id)
+                    result["success"] = True
+                    result["action"] = "back_to_review"
+
+            elif action == "add_poster":
+                # Add poster: add_poster:{user_id}
+                if len(parts) >= 2:
+                    target_user_id = int(parts[1])
+
+                    if target_user_id != user_id:
+                        await self.answer_callback_query(callback_query_id, "❌ Unauthorized", show_alert=True)
+                        return result
+
+                    await self.answer_callback_query(callback_query_id)
+                    await self.show_poster_input_prompt(user_id, chat_id, message_id)
+                    result["success"] = True
+                    result["action"] = "add_poster_shown"
+
+            elif action == "clear_poster":
+                # Clear custom poster: clear_poster:{user_id}
+                if len(parts) >= 2:
+                    target_user_id = int(parts[1])
+
+                    if target_user_id != user_id:
+                        await self.answer_callback_query(callback_query_id, "❌ Unauthorized", show_alert=True)
+                        return result
+
+                    await self.answer_callback_query(callback_query_id, "🗑️ Poster cleared")
+                    state = self.get_conversation(user_id)
+                    if state:
+                        state.custom_poster_url = None
+                        state.step = ConversationStep.AWAITING_METADATA_REVIEW
+                        state.touch()
+                        self._persist_conversation(state)
+                        await self.show_metadata_review(state, chat_id, message_id)
+                    result["success"] = True
+                    result["action"] = "poster_cleared"
+
+            # ============================================
+            # BATCH CALLBACKS
+            # ============================================
+
+            elif action == "batch":
+                # batch:{sub_action}:{user_id}[:{item_id}]
+                if len(parts) >= 3:
+                    sub_action = parts[1]
+                    target_user_id = int(parts[2])
+
+                    if target_user_id != user_id:
+                        await self.answer_callback_query(callback_query_id, "❌ Unauthorized", show_alert=True)
+                        return result
+
+                    await self.answer_callback_query(callback_query_id)
+
+                    if sub_action == "import":
+                        await self.handle_batch_import(user_id, chat_id, message_id)
+                        result["success"] = True
+                        result["action"] = "batch_import"
+
+                    elif sub_action == "review":
+                        await self.show_batch_review_list(user_id, chat_id, message_id)
+                        result["success"] = True
+                        result["action"] = "batch_review"
+
+                    elif sub_action == "item":
+                        if len(parts) >= 4:
+                            item_id = parts[3]
+                            await self.start_batch_item_wizard(user_id, chat_id, message_id, item_id)
+                            result["success"] = True
+                            result["action"] = "batch_item_review"
+
+                    elif sub_action == "summary":
+                        batch = self.get_batch(user_id)
+                        if batch:
+                            batch.editing_item_id = None
+                            self._set_batch(batch)
+                            await self.render_batch_summary(batch)
+                            result["success"] = True
+                            result["action"] = "batch_summary"
+
+                    elif sub_action == "skip_unmatched":
+                        batch = self.get_batch(user_id)
+                        if batch:
+                            for bi in batch.items:
+                                if bi.status == BatchItemStatus.NO_MATCH:
+                                    bi.status = BatchItemStatus.SKIPPED
+                            batch.touch()
+                            self._set_batch(batch)
+                            await self.render_batch_summary(batch)
+                            result["success"] = True
+                            result["action"] = "batch_skip_unmatched"
+
+                    elif sub_action == "cancel":
+                        state = self.get_conversation(user_id)
+                        if state and state.batch_item_id:
+                            batch_item_id = state.batch_item_id
+                            self.clear_conversation(user_id)
+                            await self.finish_batch_item_review(user_id, batch_item_id, success=False)
+                        else:
+                            self.clear_batch(user_id)
+                            await self.edit_message(chat_id, message_id, "🗑 *Batch cancelled.*")
+                        result["success"] = True
+                        result["action"] = "batch_cancelled"
+
+            # ============================================
+            # LEGACY CALLBACKS (backward compatibility)
+            # ============================================
+
+            elif action == "select":
+                # Legacy video match selection: select:{user_id}:{msg_id}:{imdb_id}
+                if len(parts) >= 4:
+                    target_user_id = int(parts[1])
+                    target_message_id = int(parts[2])
+                    imdb_id = parts[3]
+
+                    if target_user_id != user_id:
+                        await self.answer_callback_query(callback_query_id, "❌ Unauthorized", show_alert=True)
+                        return result
+
+                    # Try to get data from search_results first (shared across all workers via Redis)
+                    search_data = self._get_search_result(callback_data)
+
+                    # Find pending content
+                    pending_content = None
+                    for pending in self._get_pending_content(user_id):
+                        if pending.get("message_id") == target_message_id:
+                            pending_content = pending.copy()
+                            break
+
+                    if search_data:
+                        content_info = {
+                            "user_id": user_id,
+                            "chat_id": search_data.get("chat_id", chat_id),
+                            "message_id": target_message_id,
+                            "file_id": search_data.get("file_id"),
+                            "file_name": search_data.get("file_name"),
+                            "file_size": search_data.get("file_size"),
+                            "mime_type": search_data.get("mime_type"),
+                            "caption": search_data.get("caption"),
+                            "meta_id": imdb_id,
+                            "needs_linking": False,
+                            "timestamp": datetime.now().isoformat(),
+                        }
+                        title = search_data.get("title", "Unknown")
+                        year = search_data.get("year", "")
+                    elif pending_content:
+                        content_info = pending_content.copy()
+                        content_info["meta_id"] = imdb_id
+                        content_info["needs_linking"] = False
+                        try:
+                            if content_info.get("file_name"):
+                                parsed = PTT.parse_title(content_info["file_name"], True)
+                                title = parsed.get("title", "Unknown")
+                                year = parsed.get("year", "")
+                            else:
+                                title = "Unknown"
+                                year = ""
+                        except Exception:
+                            title = "Unknown"
+                            year = ""
+                    else:
+                        await self.answer_callback_query(
+                            callback_query_id, "❌ Content expired. Please forward the video again.", show_alert=True
+                        )
+                        return result
+
+                    if not content_info.get("file_id"):
+                        await self.answer_callback_query(
+                            callback_query_id, "❌ Missing file information.", show_alert=True
+                        )
+                        return result
+
+                    # Store the stream
+                    stored = await self._store_forwarded_content(content_info)
+                    if stored:
+                        year_str = f" ({year})" if year else ""
+                        await self.answer_callback_query(callback_query_id, f"✅ Linked to {title}{year_str}!")
+                        await self.edit_message(
+                            chat_id,
+                            message_id,
+                            f"✅ *Content Linked*\n\n*Title:* {title}{year_str}\n*IMDb:* `{imdb_id}`\n\nContent stored successfully!",
+                        )
+                        self._delete_search_result(callback_data)
+                        result["success"] = True
+                        result["action"] = "stored"
+                    else:
+                        await self.answer_callback_query(
+                            callback_query_id, "❌ Failed to store content.", show_alert=True
+                        )
+
+            else:
+                # Unknown callback
+                logger.warning(f"Unknown callback action: {action} in {callback_data}")
+                await self.answer_callback_query(callback_query_id, "❓ Unknown action", show_alert=True)
+
+        except Exception as e:
+            logger.exception(f"Error handling callback query: {e}")
+            await self.answer_callback_query(callback_query_id, "❌ Error processing request", show_alert=True)
+
+        return result
+
+
+# Create singleton instances
+telegram_notifier = TelegramNotifier()
+telegram_content_bot = TelegramContentBot()
+
+# Register with notification registry so streaming_providers can notify without importing us
+register_file_annotation_handler(telegram_notifier.send_file_annotation_request)
+register_pending_contribution_handler(telegram_notifier.send_pending_contribution_notification)
+register_pending_stream_suggestion_handler(telegram_notifier.send_pending_stream_suggestion_notification)
+register_pending_metadata_suggestion_handler(telegram_notifier.send_pending_metadata_suggestion_notification)
+register_pending_episode_suggestion_handler(telegram_notifier.send_pending_episode_suggestion_notification)

@@ -1,0 +1,1039 @@
+/// Registry-driven public torrent indexer scraper.
+///
+/// Handles four handler types:
+///   - Rss          — BT4G RSS feed (plain XML, no challenge)
+///   - SubsPleaseJson — SubsPlease JSON search API
+///   - KnabenJson   — Knaben's public multi-language index API
+///   - Html         — CSS-selector HTML parsing, optional TRAWL for CF-protected sites
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+use futures::{StreamExt, stream};
+use reqwest::Client;
+use scraper::{Html, Selector};
+
+use crate::{
+    parser::{
+        self,
+        episode_detector::{detect_episode, is_video_file},
+    },
+    scrapers::{
+        ScrapedStream, SearchMeta, StreamFile, fetcher,
+        prowlarr::build_series_files,
+        public_indexer_registry::{HandlerType, IndexerDef, get_indexers_for_media},
+        rss::parse_rss_xml,
+        source_health::{self, HealthGateConfig},
+        torrent_metadata,
+    },
+    state::KeywordFilterCache,
+};
+
+const MOVIE_SIMILARITY_MIN: u32 = 85;
+const SERIES_SIMILARITY_MIN: u32 = 80;
+
+static MAGNET_RE: OnceLock<regex::Regex> = OnceLock::new();
+static SIZE_RE: OnceLock<regex::Regex> = OnceLock::new();
+
+fn magnet_re() -> &'static regex::Regex {
+    MAGNET_RE.get_or_init(|| {
+        regex::Regex::new(r#"magnet:\?xt=urn:btih:(?:[a-fA-F0-9]{40}|[a-zA-Z2-7]{32})[^"'<>\s]*"#)
+            .unwrap()
+    })
+}
+
+fn size_re() -> &'static regex::Regex {
+    SIZE_RE.get_or_init(|| regex::Regex::new(r"(?i)(\d+(?:\.\d+)?)\s*(TB|GB|MB|KB|B)").unwrap())
+}
+
+/// Maximum wall-clock time for the entire public-indexers scrape.
+/// Each per-site request has its own 10 s timeout inside fetcher.rs; this
+/// budget caps the total in case many indexers time out sequentially.
+const SCRAPE_BUDGET: Duration = Duration::from_secs(25);
+
+// ─── Public entry point ───────────────────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+pub async fn scrape(
+    client: &Client,
+    meta: &SearchMeta,
+    media_type: &str,
+    season: Option<i32>,
+    episode: Option<i32>,
+    trawl_url: Option<&str>,
+    enabled_sites: Option<&str>,
+    health_gate: Option<&HealthGateConfig>,
+    keyword_filters: &KeywordFilterCache,
+) -> Vec<ScrapedStream> {
+    let trawl_available = trawl_url.is_some();
+    let indexers = get_indexers_for_media(media_type, enabled_sites, trawl_available);
+
+    let mut results: Vec<ScrapedStream> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let deadline = Instant::now() + SCRAPE_BUDGET;
+
+    for indexer in indexers {
+        if Instant::now() >= deadline {
+            tracing::debug!("public_indexers: budget exhausted, stopping early");
+            break;
+        }
+
+        // Health gate: skip sources that are consistently failing
+        if let Some(hg) = health_gate
+            && hg.enabled
+        {
+            let within_budget = source_health::is_source_within_budget(
+                &hg.redis,
+                indexer.key,
+                hg.min_samples,
+                hg.min_success_rate,
+                hg.max_timeout_rate,
+                media_type,
+                &hg.scope_mode,
+                &hg.scope_override,
+            )
+            .await;
+            if !within_budget {
+                let snapshot = source_health::get_source_health(
+                    &hg.redis,
+                    indexer.key,
+                    media_type,
+                    &hg.scope_mode,
+                    &hg.scope_override,
+                )
+                .await;
+                // Recovery: let sources with enough consecutive successes through
+                let recovery_streak = hg.recovery_success_streak;
+                if recovery_streak > 0 && snapshot.consecutive_success >= recovery_streak {
+                    tracing::debug!(
+                        "public_indexers: health gate recovery admission for {}",
+                        indexer.key
+                    );
+                } else {
+                    tracing::debug!(
+                        "public_indexers: health gate blocked {} (success_rate={:.2}, timeout_rate={:.2})",
+                        indexer.key,
+                        snapshot.success_rate(),
+                        snapshot.timeout_rate(),
+                    );
+                    continue;
+                }
+            }
+        }
+
+        let (streams, request_ok) = scrape_indexer(
+            client,
+            indexer,
+            meta,
+            media_type,
+            season,
+            episode,
+            trawl_url,
+            keyword_filters,
+        )
+        .await;
+
+        // Record outcome for health tracking
+        if let Some(hg) = health_gate
+            && hg.enabled
+        {
+            source_health::record_source_outcome(
+                &hg.redis,
+                indexer.key,
+                !streams.is_empty() || request_ok,
+                false, // timed_out — not tracked at this granularity yet
+                false, // challenge_solved
+                media_type,
+                &hg.scope_mode,
+                &hg.scope_override,
+                hg.counter_soft_cap,
+                hg.decay_factor,
+                hg.metrics_ttl_seconds,
+            )
+            .await;
+        }
+
+        for s in streams {
+            if seen.insert(s.info_hash.clone()) {
+                results.push(s);
+            }
+        }
+    }
+
+    results
+}
+
+async fn scrape_indexer(
+    client: &Client,
+    indexer: &'static IndexerDef,
+    meta: &SearchMeta,
+    media_type: &str,
+    season: Option<i32>,
+    episode: Option<i32>,
+    trawl_url: Option<&str>,
+    keyword_filters: &KeywordFilterCache,
+) -> (Vec<ScrapedStream>, bool) {
+    match indexer.handler {
+        HandlerType::Rss => {
+            scrape_rss(
+                client,
+                indexer,
+                meta,
+                media_type,
+                season,
+                episode,
+                keyword_filters,
+            )
+            .await
+        }
+        HandlerType::SubsPleaseJson => {
+            scrape_subsplease(client, indexer, meta, season, episode).await
+        }
+        HandlerType::KnabenJson => {
+            scrape_knaben(client, indexer, meta, media_type, season, episode).await
+        }
+        HandlerType::Html => {
+            scrape_html(
+                client,
+                indexer,
+                meta,
+                media_type,
+                season,
+                episode,
+                trawl_url,
+                keyword_filters,
+            )
+            .await
+        }
+    }
+}
+
+// ─── Query builder ────────────────────────────────────────────────────────────
+
+fn build_queries(
+    meta: &SearchMeta,
+    media_type: &str,
+    season: Option<i32>,
+    episode: Option<i32>,
+) -> Vec<String> {
+    if media_type == "series" {
+        match (season, episode) {
+            (Some(s), Some(e)) => vec![
+                format!("{} S{s:02}E{e:02}", meta.title),
+                format!("{} {}x{}", meta.title, s, e),
+                format!("{} S{s:02}", meta.title),
+                meta.title.clone(),
+            ],
+            _ => vec![meta.title.clone()],
+        }
+    } else {
+        let mut qs = Vec::new();
+        if let Some(y) = meta.year {
+            qs.push(format!("{} ({y})", meta.title));
+            qs.push(format!("{} {y}", meta.title));
+        }
+        qs.push(meta.title.clone());
+        qs
+    }
+}
+
+// ─── Knaben JSON API handler ─────────────────────────────────────────────────
+
+async fn scrape_knaben(
+    client: &Client,
+    indexer: &IndexerDef,
+    meta: &SearchMeta,
+    media_type: &str,
+    season: Option<i32>,
+    episode: Option<i32>,
+) -> (Vec<ScrapedStream>, bool) {
+    let sim_min = if media_type == "movie" {
+        MOVIE_SIMILARITY_MIN
+    } else {
+        SERIES_SIMILARITY_MIN
+    };
+    let mut results = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut had_http_success = false;
+
+    for query in build_queries(meta, media_type, season, episode) {
+        let response = match client
+            .post(indexer.query_url_templates[0])
+            .json(&serde_json::json!({
+                "search_type": "100%",
+                "search_field": "title",
+                "query": query,
+                "order_by": "seeders",
+                "order_direction": "desc",
+                "size": 50,
+                "hide_unsafe": true,
+                "hide_xxx": true,
+            }))
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                tracing::debug!("knaben HTTP {}", r.status());
+                continue;
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error_kind = crate::util::http::transport_error_kind(&e),
+                    "knaben request failed: {e}"
+                );
+                continue;
+            }
+        };
+        had_http_success = true;
+
+        let json: serde_json::Value = match response.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!("knaben response parse failed: {e}");
+                continue;
+            }
+        };
+        let hits = match json.get("hits").and_then(|v| v.as_array()) {
+            Some(hits) => hits,
+            None => continue,
+        };
+
+        for hit in hits {
+            let title = match hit.get("title").and_then(|v| v.as_str()) {
+                Some(title) if !title.is_empty() => title,
+                _ => continue,
+            };
+            let magnet = match hit.get("magnetUrl").and_then(|v| v.as_str()) {
+                Some(magnet) if magnet.starts_with("magnet:") => magnet,
+                _ => continue,
+            };
+            let info_hash = match parser::extract_info_hash(magnet) {
+                Some(hash) => hash.to_lowercase(),
+                None => continue,
+            };
+            if !seen.insert(info_hash.clone()) {
+                continue;
+            }
+
+            let (name, parsed) = parser::parse_magnet_stream(magnet, title);
+            let ratio =
+                parser::similarity_ratio(parsed.title.as_deref().unwrap_or(&name), &meta.title);
+            if ratio < sim_min {
+                continue;
+            }
+            if media_type == "movie"
+                && let (Some(parsed_year), Some(media_year)) = (parsed.year, meta.year)
+                && parsed_year != media_year
+            {
+                continue;
+            }
+
+            let files = if media_type == "series" {
+                build_series_files(&parsed, season, episode)
+            } else {
+                vec![]
+            };
+            if media_type == "series" && files.is_empty() {
+                continue;
+            }
+
+            results.push(ScrapedStream {
+                info_hash,
+                name,
+                source: indexer.source_name.to_string(),
+                seeders: hit
+                    .get("seeders")
+                    .and_then(|value| value.as_i64())
+                    .and_then(|value| i32::try_from(value).ok()),
+                size: hit.get("bytes").and_then(|value| value.as_i64()),
+                parsed,
+                files,
+                is_cached: false,
+                torrent_type: crate::db::TorrentType::Public,
+                torrent_file: None,
+                announce_list: vec![],
+                uploader: None,
+            });
+            if results.len() >= 50 {
+                return (results, true);
+            }
+        }
+    }
+
+    (results, had_http_success)
+}
+
+// ─── RSS handler (BT4G) ───────────────────────────────────────────────────────
+
+async fn scrape_rss(
+    client: &Client,
+    indexer: &IndexerDef,
+    meta: &SearchMeta,
+    media_type: &str,
+    season: Option<i32>,
+    episode: Option<i32>,
+    keyword_filters: &KeywordFilterCache,
+) -> (Vec<ScrapedStream>, bool) {
+    let queries = build_queries(meta, media_type, season, episode);
+    let sim_min = if media_type == "movie" {
+        MOVIE_SIMILARITY_MIN
+    } else {
+        SERIES_SIMILARITY_MIN
+    };
+    let mut results = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut had_http_success = false;
+
+    for query in &queries {
+        let url = indexer.query_url_templates[0].replace("{query}", &urlencoding::encode(query));
+        let text = match client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(20))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                had_http_success = true;
+                match r.text().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::debug!("{}: rss body: {e}", indexer.key);
+                        continue;
+                    }
+                }
+            }
+            Ok(r) => {
+                tracing::debug!("{}: rss HTTP {}", indexer.key, r.status());
+                continue;
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error_kind = crate::util::http::transport_error_kind(&e),
+                    "{}: rss fetch: {e}",
+                    indexer.key
+                );
+                continue;
+            }
+        };
+
+        for item in parse_rss_xml(&text) {
+            let title = match item.title.as_deref().filter(|t| !t.trim().is_empty()) {
+                Some(t) => t.to_string(),
+                None => continue,
+            };
+            if keyword_filters.matches_blocked_keyword(&title) {
+                continue;
+            }
+            let link = match item.link.as_deref() {
+                Some(l) => l.replace("&amp;", "&"),
+                None => continue,
+            };
+            let info_hash = match parser::extract_info_hash(&link) {
+                Some(h) => h.to_lowercase(),
+                None => continue,
+            };
+            if !seen.insert(info_hash.clone()) {
+                continue;
+            }
+            let magnet_sources = [
+                link.as_str(),
+                item.enclosure_url.as_deref().unwrap_or(""),
+                item.description.as_deref().unwrap_or(""),
+            ];
+            let (stream_name, parsed) =
+                parser::parse_stream_name_from_sources(&magnet_sources, &title);
+            let ratio = parser::similarity_ratio(
+                parsed.title.as_deref().unwrap_or(&stream_name),
+                &meta.title,
+            );
+            if ratio < sim_min {
+                continue;
+            }
+            if media_type == "movie"
+                && let (Some(py), Some(my)) = (parsed.year, meta.year)
+                && py != my
+            {
+                continue;
+            }
+            let files = if media_type == "series" {
+                build_series_files(&parsed, season, episode)
+            } else {
+                vec![]
+            };
+            if media_type == "series" && files.is_empty() {
+                continue;
+            }
+            let size = item.description.as_deref().and_then(parse_size_bytes);
+            results.push(ScrapedStream {
+                info_hash,
+                name: stream_name,
+                source: indexer.source_name.to_string(),
+                seeders: Some(0),
+                size,
+                parsed,
+                files,
+                is_cached: false,
+                torrent_type: crate::db::TorrentType::Public,
+                torrent_file: None,
+                announce_list: vec![],
+                uploader: None,
+            });
+        }
+    }
+    (results, had_http_success)
+}
+
+// ─── SubsPlease JSON handler ──────────────────────────────────────────────────
+
+async fn scrape_subsplease(
+    client: &Client,
+    indexer: &IndexerDef,
+    meta: &SearchMeta,
+    season: Option<i32>,
+    episode: Option<i32>,
+) -> (Vec<ScrapedStream>, bool) {
+    let url = indexer.query_url_templates[0].replace("{query}", &urlencoding::encode(&meta.title));
+
+    let json: serde_json::Value = match client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(20))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => match r.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!("subsplease json parse: {e}");
+                return (vec![], true); // got 2xx but couldn't parse — still counts as http ok
+            }
+        },
+        Ok(r) => {
+            tracing::debug!("subsplease HTTP {}", r.status());
+            return (vec![], false);
+        }
+        Err(e) => {
+            tracing::debug!(
+                error_kind = crate::util::http::transport_error_kind(&e),
+                "subsplease fetch: {e}"
+            );
+            return (vec![], false);
+        }
+    };
+
+    let obj = match json.as_object() {
+        Some(o) => o,
+        None => return (vec![], false),
+    };
+
+    let mut results = Vec::new();
+    for (_, show_data) in obj {
+        let show_name = match show_data.get("show").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => continue,
+        };
+        let sim = parser::similarity_ratio(&show_name, &meta.title);
+        if sim < SERIES_SIMILARITY_MIN {
+            continue;
+        }
+        let downloads = match show_data.get("downloads").and_then(|v| v.as_array()) {
+            Some(d) => d,
+            None => continue,
+        };
+        for dl in downloads {
+            let magnet = match dl
+                .get("magnet")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                Some(m) => m,
+                None => continue,
+            };
+            let info_hash = match parser::extract_info_hash(magnet) {
+                Some(h) => h.to_lowercase(),
+                None => continue,
+            };
+            let res = dl.get("res").and_then(|v| v.as_str()).unwrap_or("");
+            let fallback_name = if res.is_empty() {
+                show_name.clone()
+            } else {
+                format!("{show_name} - {res}p")
+            };
+            let size = dl
+                .get("size")
+                .and_then(|v| v.as_str())
+                .and_then(parse_size_bytes);
+            let (name, parsed) = parser::parse_magnet_stream(magnet, &fallback_name);
+            let files = build_series_files(&parsed, season, episode);
+            if files.is_empty() {
+                continue;
+            }
+            results.push(ScrapedStream {
+                info_hash,
+                name,
+                source: indexer.source_name.to_string(),
+                seeders: None,
+                size,
+                parsed,
+                files,
+                is_cached: false,
+                torrent_type: crate::db::TorrentType::Public,
+                torrent_file: None,
+                announce_list: vec![],
+                uploader: None,
+            });
+        }
+    }
+    (results, true) // got a successful HTTP response
+}
+
+// ─── HTML handler ─────────────────────────────────────────────────────────────
+
+/// Owned data extracted synchronously from a single listing row.
+/// Held across `.await` boundaries, so must be fully `Send`.
+pub struct RowData {
+    pub title: String,
+    pub magnet_href: Option<String>,
+    pub detail_href: Option<String>,
+    /// Direct `.torrent` metadata link when exposed by the listing. LimeTorrents
+    /// provides this separately from its human-facing detail link.
+    pub torrent_href: Option<String>,
+    pub size_str: Option<String>,
+    pub seeder_str: Option<String>,
+}
+
+/// Extract row data from the HTML document without any async operations.
+/// The `Html` type is not `Send`; dropping it before any `.await` keeps the
+/// future `Send` and allows it to be spawned onto a `JoinSet`.
+pub fn extract_row_data_pub(doc: &Html, indexer: &IndexerDef) -> Vec<RowData> {
+    extract_row_data(doc, indexer)
+}
+
+fn extract_row_data(doc: &Html, indexer: &IndexerDef) -> Vec<RowData> {
+    select_rows(doc, indexer.row_selectors)
+        .into_iter()
+        .filter_map(|row| {
+            let title = select_text_in_element(row, indexer.title_selectors)?;
+            if title.is_empty() {
+                return None;
+            }
+            Some(RowData {
+                title,
+                magnet_href: select_text_in_element(row, indexer.magnet_selectors),
+                detail_href: select_text_in_element(row, indexer.detail_selectors),
+                torrent_href: (indexer.key == "limetorrents")
+                    .then(|| select_text_in_element(row, &["a.csprite_dl14::attr(href)"]))
+                    .flatten(),
+                size_str: select_text_in_element(row, indexer.size_selectors),
+                seeder_str: select_text_in_element(row, indexer.seeder_selectors),
+            })
+        })
+        .collect()
+}
+
+async fn scrape_html(
+    client: &Client,
+    indexer: &'static IndexerDef,
+    meta: &SearchMeta,
+    media_type: &str,
+    season: Option<i32>,
+    episode: Option<i32>,
+    trawl_url: Option<&str>,
+    keyword_filters: &KeywordFilterCache,
+) -> (Vec<ScrapedStream>, bool) {
+    let queries = build_queries(meta, media_type, season, episode);
+    let sim_min = if media_type == "movie" {
+        MOVIE_SIMILARITY_MIN
+    } else {
+        SERIES_SIMILARITY_MIN
+    };
+    let mut results = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut had_http_success = false;
+
+    'outer: for query in &queries {
+        let encoded = urlencoding::encode(query).to_string();
+
+        'templates: for url_template in indexer.query_url_templates {
+            for page in 1..=indexer.pages_per_query {
+                let url = url_template
+                    .replace("{query}", &encoded)
+                    .replace("{page}", &page.to_string());
+
+                let fr = match fetcher::fetch_for_indexer(
+                    client,
+                    trawl_url,
+                    &url,
+                    indexer.solve_cloudflare,
+                    indexer.http_fallback,
+                )
+                .await
+                {
+                    Some(r) => {
+                        had_http_success = true;
+                        r
+                    }
+                    None => {
+                        tracing::debug!("{}: fetch failed for {url}", indexer.key);
+                        continue 'templates;
+                    }
+                };
+
+                let base_url = fr.final_url.clone();
+
+                // Parse HTML and extract all row data synchronously so the non-Send
+                // `Html` document is dropped before any subsequent `.await`.
+                let row_data: Vec<RowData> = {
+                    let doc = Html::parse_document(&fr.html);
+                    let data = extract_row_data(&doc, indexer);
+                    if data.is_empty() {
+                        tracing::debug!("{}: no rows found on {url}", indexer.key);
+                    }
+                    data
+                }; // `doc` dropped here — future is now Send again
+
+                // Direct metainfo inspection may involve a remote `.torrent`
+                // download. Bound concurrency so one slow mirror does not make
+                // every plausible result wait serially.
+                let processed = stream::iter(row_data)
+                    .map(|data| {
+                        process_row_data(
+                            client,
+                            indexer,
+                            meta,
+                            media_type,
+                            season,
+                            episode,
+                            data,
+                            &base_url,
+                            sim_min,
+                            trawl_url,
+                            keyword_filters,
+                        )
+                    })
+                    .buffer_unordered(8)
+                    .collect::<Vec<_>>()
+                    .await;
+
+                for stream in processed.into_iter().flatten() {
+                    if seen.insert(stream.info_hash.clone()) {
+                        results.push(stream);
+                        if results.len() >= 50 {
+                            break 'outer;
+                        }
+                    }
+                }
+                if !results.is_empty() {
+                    break 'templates;
+                }
+            }
+        }
+    }
+    (results, had_http_success)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_row_data(
+    client: &Client,
+    indexer: &IndexerDef,
+    meta: &SearchMeta,
+    media_type: &str,
+    season: Option<i32>,
+    episode: Option<i32>,
+    data: RowData,
+    base_url: &str,
+    sim_min: u32,
+    trawl_url: Option<&str>,
+    keyword_filters: &KeywordFilterCache,
+) -> Option<ScrapedStream> {
+    if keyword_filters.matches_blocked_keyword(&data.title) {
+        return None;
+    }
+    let row_title = data.title.clone();
+
+    // Reject obviously unrelated rows before following detail or metainfo links.
+    // This also keeps LimeTorrents metadata inspection bounded to plausible hits.
+    let row_parsed = parser::parse_title(&row_title);
+    let row_ratio = parser::similarity_ratio(
+        row_parsed.title.as_deref().unwrap_or(&row_title),
+        &meta.title,
+    );
+    if row_ratio < sim_min {
+        return None;
+    }
+    if media_type == "movie"
+        && let (Some(py), Some(my)) = (row_parsed.year, meta.year)
+        && py != my
+    {
+        return None;
+    }
+
+    // Prefer a direct `.torrent` link when the indexer exposes one. Unlike a
+    // magnet display name, metainfo contains the real internal filenames, so
+    // executable-only/fake releases can be rejected before they reach the DB.
+    let parsed_torrent = if let Some(href) = data.torrent_href.as_deref() {
+        let url = resolve_url(base_url, href)?;
+        torrent_metadata::download_torrent_bytes(client, &url, Duration::from_secs(8))
+            .await
+            .and_then(|bytes| torrent_metadata::parse_torrent_bytes(&bytes))
+    } else {
+        None
+    };
+
+    if let Some(torrent) = parsed_torrent.as_ref() {
+        let blocked_file = torrent
+            .files
+            .iter()
+            .find(|file| keyword_filters.matches_blocked_keyword(&file.path));
+        if let Some(file) = blocked_file {
+            tracing::warn!(
+                indexer = indexer.key,
+                info_hash = %torrent.info_hash,
+                filename = %file.path,
+                "public indexer torrent metadata matched a blocked filename"
+            );
+            return None;
+        }
+        if !torrent.files.iter().any(|file| is_video_file(&file.path)) {
+            tracing::warn!(
+                indexer = indexer.key,
+                info_hash = %torrent.info_hash,
+                file_count = torrent.files.len(),
+                "public indexer torrent metadata contained no playable video files"
+            );
+            return None;
+        }
+    }
+
+    // Try direct magnet from listing row, otherwise follow the detail page.
+    let (info_hash, magnet_url) = if let Some(torrent) = parsed_torrent.as_ref() {
+        (
+            torrent.info_hash.clone(),
+            format!(
+                "magnet:?xt=urn:btih:{}&dn={}",
+                torrent.info_hash,
+                urlencoding::encode(&torrent.name)
+            ),
+        )
+    } else {
+        match data
+            .magnet_href
+            .as_deref()
+            .filter(|m| m.starts_with("magnet:"))
+            .and_then(|magnet| {
+                parser::extract_info_hash(magnet).map(|h| (h.to_lowercase(), magnet.to_string()))
+            }) {
+            Some(found) => found,
+            None => {
+                let detail_href = data.detail_href?;
+                if detail_href.len() > indexer.max_detail_url_length {
+                    return None;
+                }
+                let detail_url = resolve_url(base_url, &detail_href)?;
+                let dr = fetcher::fetch_for_indexer(
+                    client,
+                    trawl_url,
+                    &detail_url,
+                    indexer.solve_cloudflare,
+                    indexer.http_fallback,
+                )
+                .await?;
+                let magnet = find_magnet_in_html(&dr.html)?;
+                let hash = parser::extract_info_hash(&magnet)?.to_lowercase();
+                (hash, magnet)
+            }
+        }
+    };
+
+    let (stream_name, parsed) = parser::parse_magnet_stream(&magnet_url, &row_title);
+    let ratio =
+        parser::similarity_ratio(parsed.title.as_deref().unwrap_or(&stream_name), &meta.title);
+    if ratio < sim_min {
+        return None;
+    }
+    if media_type == "movie"
+        && let (Some(py), Some(my)) = (parsed.year, meta.year)
+        && py != my
+    {
+        return None;
+    }
+
+    let size = parsed_torrent
+        .as_ref()
+        .map(|torrent| torrent.total_size)
+        .or_else(|| data.size_str.as_deref().and_then(parse_size_bytes));
+    let seeders = data
+        .seeder_str
+        .as_deref()
+        .and_then(|s| s.trim().parse::<i32>().ok());
+
+    let files = if let Some(torrent) = parsed_torrent.as_ref() {
+        torrent
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, file)| is_video_file(&file.path))
+            .filter_map(|(index, file)| {
+                if media_type == "series" {
+                    let detected = detect_episode(&file.path, season.unwrap_or(1))?;
+                    Some(StreamFile {
+                        file_index: index as i32,
+                        filename: file.path.clone(),
+                        season_number: detected.season,
+                        episode_number: detected.episode,
+                    })
+                } else {
+                    Some(StreamFile {
+                        file_index: index as i32,
+                        filename: file.path.clone(),
+                        season_number: 0,
+                        episode_number: 0,
+                    })
+                }
+            })
+            .collect()
+    } else if media_type == "series" {
+        build_series_files(&parsed, season, episode)
+    } else {
+        vec![]
+    };
+    if media_type == "series" && files.is_empty() {
+        return None;
+    }
+
+    Some(ScrapedStream {
+        info_hash,
+        name: stream_name,
+        source: indexer.source_name.to_string(),
+        seeders,
+        size,
+        parsed,
+        files,
+        is_cached: false,
+        torrent_type: crate::db::TorrentType::Public,
+        torrent_file: None,
+        announce_list: parsed_torrent
+            .map(|torrent| torrent.announce_list)
+            .unwrap_or_default(),
+        uploader: None,
+    })
+}
+
+fn find_magnet_in_html(html: &str) -> Option<String> {
+    magnet_re().find(html).map(|m| m.as_str().to_string())
+}
+
+// ─── CSS selector helpers ─────────────────────────────────────────────────────
+
+enum SelectorPseudo {
+    Text,
+    Attr(String),
+    None,
+}
+
+/// Strip parsel-style `::text` / `::attr(name)` pseudo-elements from a selector
+/// string, returning the clean CSS and what to extract.
+fn parse_pseudo(s: &str) -> (&str, SelectorPseudo) {
+    if let Some(css) = s.strip_suffix("::text") {
+        return (css, SelectorPseudo::Text);
+    }
+    if s.ends_with(')')
+        && let Some(pos) = s.rfind("::attr(")
+    {
+        let css = &s[..pos];
+        let attr = s[pos + 7..s.len() - 1].to_string();
+        return (css, SelectorPseudo::Attr(attr));
+    }
+    (s, SelectorPseudo::None)
+}
+
+/// Try each selector in order and return the first non-empty value from `element`.
+fn select_text_in_element(element: scraper::ElementRef<'_>, selectors: &[&str]) -> Option<String> {
+    for selector_str in selectors {
+        let (css, pseudo) = parse_pseudo(selector_str);
+        let sel = match Selector::parse(css) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        for sub_el in element.select(&sel) {
+            let value: String = match &pseudo {
+                SelectorPseudo::Text | SelectorPseudo::None => {
+                    sub_el.text().collect::<Vec<_>>().concat()
+                }
+                SelectorPseudo::Attr(attr) => match sub_el.value().attr(attr.as_str()) {
+                    Some(v) => v.to_string(),
+                    None => continue,
+                },
+            };
+            let value = value.trim().to_string();
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+/// Find all rows matching the first selector that yields any elements.
+fn select_rows<'a>(doc: &'a Html, selectors: &[&str]) -> Vec<scraper::ElementRef<'a>> {
+    for selector_str in selectors {
+        let parsed_sel = Selector::parse(selector_str);
+        if let Ok(sel) = parsed_sel {
+            let rows: Vec<_> = doc.select(&sel).collect();
+            if !rows.is_empty() {
+                return rows;
+            }
+        }
+    }
+    vec![]
+}
+
+/// Resolve a potentially-relative href against a base URL.
+fn resolve_url(base: &str, href: &str) -> Option<String> {
+    if href.is_empty() {
+        return None;
+    }
+    if href.starts_with("magnet:") || href.starts_with("http://") || href.starts_with("https://") {
+        return Some(href.to_string());
+    }
+    if href.starts_with("//") {
+        let scheme = if base.starts_with("https") {
+            "https"
+        } else {
+            "http"
+        };
+        return Some(format!("{scheme}:{href}"));
+    }
+    // Extract scheme://host from base
+    let origin = base
+        .find("://")
+        .and_then(|i| base[i + 3..].find('/').map(|j| &base[..i + 3 + j]))
+        .unwrap_or_else(|| base.trim_end_matches('/'));
+    if href.starts_with('/') {
+        Some(format!("{origin}{href}"))
+    } else {
+        let base_dir = base.rfind('/').map(|i| &base[..i]).unwrap_or(base);
+        Some(format!("{base_dir}/{href}"))
+    }
+}
+
+// ─── Size parsing ─────────────────────────────────────────────────────────────
+
+/// Public wrapper for size parsing — used by registry_crawl.
+pub fn parse_size_bytes_pub(s: &str) -> Option<i64> {
+    parse_size_bytes(s)
+}
+
+fn parse_size_bytes(s: &str) -> Option<i64> {
+    let m = size_re().captures(s)?;
+    let val: f64 = m[1].parse().ok()?;
+    let mult: f64 = match m[2].to_uppercase().as_str() {
+        "TB" => 1_099_511_627_776.0,
+        "GB" => 1_073_741_824.0,
+        "MB" => 1_048_576.0,
+        "KB" => 1_024.0,
+        "B" => 1.0,
+        _ => return None,
+    };
+    Some((val * mult) as i64)
+}

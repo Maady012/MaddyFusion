@@ -1,0 +1,975 @@
+/// Scrapers for Tamil torrent forums: TamilMV and TamilBlasters.
+///
+/// Both sites use IPS (Invision Power Suite) forum software.
+/// The forum listing pages expose topic links via `li[data-rowid] a[data-ipshover-target]`.
+/// Each topic page then has `.torrent` download links via `a[data-fileext='torrent']`.
+///
+/// Since both spiders share identical structure (only the homepage differs), a
+/// single shared helper `scrape_tamil_forum` does the actual work.
+use async_trait::async_trait;
+use scraper::{Html, Selector};
+use tracing::{debug, info, warn};
+
+use crate::{
+    jobs::{
+        error::JobError,
+        handler::{JobCtx, JobHandler},
+    },
+    parser,
+    scrapers::{
+        ScrapedStream, SearchMeta,
+        fetcher::{fetch_plain, fetch_trawl},
+        media_resolve,
+        prowlarr::build_series_files,
+        stream_convert,
+    },
+    util::{rate_limit, retry},
+};
+
+// ─── IPS forum CSS selectors ──────────────────────────────────────────────────
+//
+// Forum listing page (e.g. /index.php?/forums/forum/<id>/page/<n>/):
+//   - Topic rows:    li[data-rowid]
+//   - Topic link:    a[data-ipshover-target]   (href = full topic URL)
+//
+// Topic / movie page:
+//   - Torrent links: a[data-fileext='torrent'] (href = direct .torrent download URL)
+//   - Poster image:  div[data-role='commentContent'] img (first non-GIF)
+
+use super::spider_args::parse_listing_page_args;
+
+/// One forum listing to scrape, with language/video-type context for catalog linking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForumTarget {
+    forum_id: String,
+    language: String,
+    video_type: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IpsForumPage {
+    forum_id: u64,
+    page: u32,
+}
+
+/// Parse the stable numeric forum ID and effective page from an IPS forum URL.
+/// IPS represents page 1 with either the base forum route or an explicit `/page/1/`.
+fn parse_ips_forum_page(url: &str) -> Option<IpsForumPage> {
+    fn parse_route(route: &str) -> Option<IpsForumPage> {
+        let segments: Vec<&str> = route
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        let forum_pos = segments
+            .windows(2)
+            .position(|pair| pair == ["forums", "forum"])?;
+        let forum_slug = *segments.get(forum_pos + 2)?;
+        let forum_id = forum_slug.split('-').next()?.parse().ok()?;
+        let page = match &segments[forum_pos + 3..] {
+            [] => 1,
+            ["page", page] => page.parse().ok()?,
+            _ => return None,
+        };
+
+        Some(IpsForumPage { forum_id, page })
+    }
+
+    let parsed = url::Url::parse(url).ok()?;
+    parsed
+        .query()
+        .and_then(|query| query.split('&').next())
+        .filter(|route| route.starts_with('/'))
+        .and_then(parse_route)
+        .or_else(|| parse_route(parsed.path()))
+}
+
+/// Return the lower page reached when an IPS listing request rolls back within
+/// the same numeric forum. Unrelated redirects and page-1 canonicalization are ignored.
+fn pagination_rollback_page(
+    requested_url: &str,
+    final_url: &str,
+    requested_page: u32,
+) -> Option<u32> {
+    if requested_page <= 1 {
+        return None;
+    }
+
+    let requested = parse_ips_forum_page(requested_url)?;
+    if requested.page != requested_page {
+        return None;
+    }
+    let final_page = parse_ips_forum_page(final_url)?;
+
+    (requested.forum_id == final_page.forum_id && final_page.page < requested_page)
+        .then_some(final_page.page)
+}
+
+/// Build `{language}_{video_type}` catalog keys from scraper config (e.g. `tamil_hdrip`).
+fn catalog_id_for_target(language: &str, video_type: &str) -> String {
+    format!("{}_{}", language.to_ascii_lowercase(), video_type)
+}
+
+/// Collect forum IDs with their language and video-type from the nested catalogs config.
+fn collect_forum_targets(catalogs: &serde_json::Value) -> Vec<ForumTarget> {
+    let mut targets = Vec::new();
+    let Some(catalogs_map) = catalogs.as_object() else {
+        return targets;
+    };
+
+    for (language, lang_val) in catalogs_map {
+        let Some(lang_obj) = lang_val.as_object() else {
+            continue;
+        };
+        for (video_type, id_val) in lang_obj {
+            match id_val {
+                serde_json::Value::String(s) => {
+                    targets.push(ForumTarget {
+                        forum_id: s.clone(),
+                        language: language.clone(),
+                        video_type: video_type.clone(),
+                    });
+                }
+                serde_json::Value::Array(arr) => {
+                    for v in arr {
+                        if let Some(s) = v.as_str() {
+                            targets.push(ForumTarget {
+                                forum_id: s.to_string(),
+                                language: language.clone(),
+                                video_type: video_type.clone(),
+                            });
+                        }
+                    }
+                }
+                serde_json::Value::Number(n) => {
+                    targets.push(ForumTarget {
+                        forum_id: n.to_string(),
+                        language: language.clone(),
+                        video_type: video_type.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    targets
+}
+
+/// Mirrors Python `CatalogParsePipeline` guards for English/dubbed edge cases.
+fn should_link_catalog(language: &str, video_type: &str, torrent_name: &str) -> bool {
+    let lang_lower = language.to_ascii_lowercase();
+    let name_lower = torrent_name.to_ascii_lowercase();
+    if lang_lower == "english" && !name_lower.contains("eng") {
+        return false;
+    }
+    if video_type == "dubbed" && lang_lower == "english" {
+        return false;
+    }
+    true
+}
+
+// ─── Config reader ────────────────────────────────────────────────────────────
+
+/// Load the homepage for a spider from the scraper config JSON.
+///
+/// Falls back to a hard-coded default when the config file is missing or the
+/// key is absent, so the handler can still run.
+fn spider_homepage(spider_name: &str, default: &str, root: &serde_json::Value) -> String {
+    root.get(spider_name)
+        .and_then(|v| v.get("homepage"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| default.to_string())
+}
+
+// ─── Shared scraping logic ────────────────────────────────────────────────────
+
+/// Scrape up to `pages` forum listing pages (from `start_page`) for `spider_name`.
+///
+/// For each topic found, fetches the topic page, collects torrent download
+/// links, resolves/creates a media entry via title metadata lookup, and
+/// persists each stream linked to its media_id.
+async fn scrape_tamil_forum(
+    spider_name: &str,
+    source_label: &str,
+    homepage: &str,
+    catalogs: &serde_json::Value,
+    pages: u32,
+    start_page: u32,
+    ctx: &JobCtx,
+) -> Result<(), JobError> {
+    let client = &ctx.state.http;
+    let trawl_url = ctx.state.config.trawl_url.clone();
+    let pool = &ctx.state.pool;
+
+    // Build the CSS selectors once.
+    let row_sel = Selector::parse("li[data-rowid]").expect("li[data-rowid]");
+    let link_sel = Selector::parse("a[data-ipshover-target]").expect("a[data-ipshover-target]");
+    let torrent_sel =
+        Selector::parse("a[data-fileext='torrent']").expect("a[data-fileext='torrent']");
+
+    let forum_targets = collect_forum_targets(catalogs);
+
+    if forum_targets.is_empty() {
+        warn!("{spider_name}: no forum IDs found in config, aborting");
+        return Ok(());
+    }
+
+    info!(
+        "{spider_name}: listing pages {start_page}..={}",
+        start_page.saturating_add(pages.saturating_sub(1))
+    );
+
+    let mut all_streams: Vec<()> = Vec::new();
+
+    for target in &forum_targets {
+        let forum_id = &target.forum_id;
+        let catalog_id = catalog_id_for_target(&target.language, &target.video_type);
+        let is_series = target.video_type == "series";
+        let media_type_str = if is_series { "series" } else { "movie" };
+
+        for page in start_page..start_page.saturating_add(pages) {
+            if ctx.is_cancelled() {
+                return Err(JobError::Cancelled);
+            }
+
+            let listing_url = format!("{homepage}/index.php?/forums/forum/{forum_id}/page/{page}/");
+            rate_limit::wait(&rate_limit::domain_key(homepage), 1).await;
+
+            let listing_result = retry::with_retry(spider_name, || {
+                let url = listing_url.clone();
+                let client = client.clone();
+                let bp = trawl_url.clone();
+                async move {
+                    if let Some(bp_url) = &bp
+                        && let Some(r) = fetch_trawl(&client, bp_url, &url).await
+                    {
+                        return Ok(r);
+                    }
+                    fetch_plain(&client, &url)
+                        .await
+                        .ok_or_else(|| format!("fetch failed: {url}"))
+                }
+            })
+            .await;
+
+            let Ok(listing_result) = listing_result else {
+                debug!("{spider_name}: empty listing page {page} for forum {forum_id}");
+                break;
+            };
+
+            if let Some(final_page) =
+                pagination_rollback_page(&listing_url, &listing_result.final_url, page)
+            {
+                info!(
+                    "{spider_name}: forum {forum_id} page {page} rolled back to page {final_page}; stopping this forum"
+                );
+                break;
+            }
+
+            let html = listing_result.html;
+
+            if html.is_empty() {
+                debug!("{spider_name}: empty listing page {page} for forum {forum_id}");
+                break;
+            }
+
+            // Parse the listing HTML in a scoped block so the non-Send
+            // `Html` value is dropped before any `.await` point below.
+            let topic_links: Vec<String> = {
+                let doc = Html::parse_document(&html);
+                doc.select(&row_sel)
+                    .filter_map(|row| {
+                        row.select(&link_sel)
+                            .next()
+                            .and_then(|a| a.value().attr("href"))
+                            .map(|href| {
+                                if href.starts_with("http") {
+                                    href.to_string()
+                                } else {
+                                    format!("{homepage}{href}")
+                                }
+                            })
+                    })
+                    .collect()
+            }; // doc dropped here
+
+            if topic_links.is_empty() {
+                debug!("{spider_name}: no topics on page {page} for forum {forum_id}");
+                break;
+            }
+
+            info!(
+                "{spider_name}: forum {forum_id} page {page}: {} topics",
+                topic_links.len()
+            );
+
+            for topic_url in topic_links {
+                if ctx.is_cancelled() {
+                    return Err(JobError::Cancelled);
+                }
+                rate_limit::wait(&rate_limit::domain_key(homepage), 1).await;
+
+                let topic_html = retry::with_retry(spider_name, || {
+                    let url = topic_url.clone();
+                    let client = client.clone();
+                    let bp = trawl_url.clone();
+                    async move {
+                        if let Some(bp_url) = &bp
+                            && let Some(r) = fetch_trawl(&client, bp_url, &url).await
+                        {
+                            return Ok(r.html);
+                        }
+                        fetch_plain(&client, &url)
+                            .await
+                            .map(|r| r.html)
+                            .ok_or_else(|| format!("fetch failed: {url}"))
+                    }
+                })
+                .await
+                .unwrap_or_default();
+
+                if topic_html.is_empty() {
+                    continue;
+                }
+
+                // Extract title + torrent links from topic page in a scoped
+                // block so the non-Send `Html` value is dropped before any
+                // subsequent `.await` point.
+                let (title, torrent_links): (String, Vec<String>) = {
+                    let topic_doc = Html::parse_document(&topic_html);
+                    let h1_sel = Selector::parse("h1").unwrap();
+                    let title_sel = Selector::parse("title").unwrap();
+                    let title = topic_doc
+                        .select(&h1_sel)
+                        .next()
+                        .map(|el| el.text().collect::<String>().trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| {
+                            topic_doc
+                                .select(&title_sel)
+                                .next()
+                                .map(|el| el.text().collect::<String>().trim().to_string())
+                        })
+                        .unwrap_or_default();
+
+                    let torrent_links: Vec<String> = topic_doc
+                        .select(&torrent_sel)
+                        .filter_map(|a| a.value().attr("href"))
+                        .map(|href| {
+                            if href.starts_with("http") {
+                                href.to_string()
+                            } else {
+                                format!("{homepage}{href}")
+                            }
+                        })
+                        .collect();
+
+                    (title, torrent_links)
+                    // topic_doc dropped here
+                };
+
+                if torrent_links.is_empty() || title.is_empty() {
+                    continue;
+                }
+
+                // Topic title drives media lookup; each torrent name drives stream metadata.
+                let topic_parsed = parser::parse_title(&title);
+                let clean_title = topic_parsed.title.as_deref().unwrap_or(&title).to_string();
+
+                // Resolve or create media (PTT clean title → DB lookup → TMDB → stub).
+                let tmdb_key = ctx.state.config.tmdb_api_key.as_deref();
+                let catalog_ids: Vec<&str> =
+                    if should_link_catalog(&target.language, &target.video_type, &title) {
+                        vec![catalog_id.as_str()]
+                    } else {
+                        vec![]
+                    };
+                let media_entry = media_resolve::find_or_create_media(
+                    pool,
+                    &ctx.state.http,
+                    &clean_title,
+                    topic_parsed.year,
+                    is_series,
+                    &catalog_ids,
+                    tmdb_key,
+                    ctx.state.config.imdb_cinemeta_fallback_enabled,
+                )
+                .await;
+
+                let (media_id, imdb_id) = match media_entry {
+                    Some(m) => {
+                        if !catalog_ids.is_empty() {
+                            media_resolve::link_to_catalogs(pool, m.id, &catalog_ids).await;
+                        }
+                        (m.id, None::<String>)
+                    }
+                    None => {
+                        warn!("{spider_name}: could not find/create media for '{title}'");
+                        continue;
+                    }
+                };
+
+                let meta = SearchMeta {
+                    media_id: crate::db::MediaId(media_id),
+                    imdb_id,
+                    title: clean_title.clone(),
+                    year: topic_parsed.year,
+                };
+
+                // Each torrent link for this topic becomes one ScrapedStream.
+                for torrent_url in &torrent_links {
+                    rate_limit::wait(&rate_limit::domain_key(homepage), 1).await;
+                    let torrent_bytes = retry::with_retry(spider_name, || {
+                        let url = torrent_url.clone();
+                        let client = client.clone();
+                        async move {
+                            client
+                                .get(&url)
+                                .timeout(std::time::Duration::from_secs(30))
+                                .send()
+                                .await
+                                .map_err(|e| e.to_string())?
+                                .bytes()
+                                .await
+                                .map_err(|e| e.to_string())
+                        }
+                    })
+                    .await
+                    .unwrap_or_default();
+
+                    let Some(torrent_info) = extract_torrent_info(&torrent_bytes) else {
+                        debug!("{spider_name}: no info_hash for {torrent_url}");
+                        continue;
+                    };
+
+                    let torrent_name = torrent_info.name.unwrap_or_else(|| title.clone());
+                    let stream_parsed = parser::parse_title(&torrent_name);
+                    let files = if is_series {
+                        build_series_files(&stream_parsed, None, None)
+                    } else {
+                        vec![]
+                    };
+                    let stream = ScrapedStream {
+                        info_hash: torrent_info.info_hash,
+                        name: torrent_name,
+                        source: source_label.to_string(),
+                        seeders: None,
+                        size: torrent_info.total_size,
+                        parsed: stream_parsed,
+                        files,
+                        is_cached: false,
+                        torrent_type: crate::db::TorrentType::Public,
+                        torrent_file: None,
+                        announce_list: vec![],
+                        uploader: None,
+                    };
+                    stream_convert::write_back_torrents(
+                        pool,
+                        &[stream],
+                        &meta,
+                        media_type_str,
+                        None,
+                        None,
+                    )
+                    .await;
+                    all_streams.push(());
+                }
+            }
+
+            if !all_streams.is_empty() {
+                info!(
+                    "{spider_name}: forum {forum_id} page {page}: flushed {} streams",
+                    all_streams.len()
+                );
+                all_streams.clear();
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ─── Torrent info_hash extraction ─────────────────────────────────────────────
+
+struct TorrentInfo {
+    info_hash: String,
+    name: Option<String>,
+    total_size: Option<i64>,
+}
+
+/// Parse a bencoded `.torrent` file and return the info_hash, name, and total
+/// size extracted from the `info` dictionary.
+fn extract_torrent_info(data: &[u8]) -> Option<TorrentInfo> {
+    use sha1::{Digest, Sha1};
+
+    // Find "4:info" in the bencode stream.
+    let needle = b"4:info";
+    let pos = data.windows(needle.len()).position(|w| w == needle)?;
+    let info_start = pos + needle.len();
+
+    let info_end = bencode_end(data, info_start)?;
+    let info_slice = &data[info_start..info_end];
+
+    let mut hasher = Sha1::new();
+    hasher.update(info_slice);
+    let hash = hasher.finalize();
+    let info_hash = hash.iter().map(|b| format!("{b:02x}")).collect();
+
+    // Parse name and total_size from the info dict.
+    let name = bencode_dict_str(info_slice, b"name");
+    let total_size = bencode_total_size(info_slice);
+
+    Some(TorrentInfo {
+        info_hash,
+        name,
+        total_size,
+    })
+}
+
+/// Extract a UTF-8 string value from a flat bencode dict by key.
+fn bencode_dict_str(dict: &[u8], key: &[u8]) -> Option<String> {
+    // dict starts with 'd'; iterate key-value pairs.
+    if dict.first() != Some(&b'd') {
+        return None;
+    }
+    let mut i = 1;
+    while i < dict.len() {
+        if dict[i] == b'e' {
+            break;
+        }
+        // Read key string
+        let key_end = bencode_end(dict, i)?;
+        let colon = dict[i..].iter().position(|&b| b == b':')?;
+        let key_bytes = &dict[i + colon + 1..key_end];
+        // Read value
+        let val_end = bencode_end(dict, key_end)?;
+        if key_bytes == key {
+            // Value is a bencode string
+            if let Some(c) = dict[key_end..].iter().position(|&b| b == b':') {
+                let val_bytes = &dict[key_end + c + 1..val_end];
+                return std::str::from_utf8(val_bytes).ok().map(|s| s.to_string());
+            }
+        }
+        i = val_end;
+    }
+    None
+}
+
+/// Return the total size of a torrent from its info dict.
+/// Single-file: `length` key. Multi-file: sum of `length` across `files` list.
+fn bencode_total_size(info: &[u8]) -> Option<i64> {
+    // Try single-file first: look for "6:length" directly in info dict.
+    if let Some(len) = bencode_dict_int(info, b"length") {
+        return Some(len);
+    }
+    // Multi-file: sum lengths in the `files` list.
+    let files_key = b"5:files";
+    let pos = info.windows(files_key.len()).position(|w| w == files_key)?;
+    let list_start = pos + files_key.len();
+    if info.get(list_start) != Some(&b'l') {
+        return None;
+    }
+    let mut total: i64 = 0;
+    let mut i = list_start + 1;
+    while i < info.len() {
+        if info[i] == b'e' {
+            break;
+        }
+        // Each element is a dict; find "6:length" inside it.
+        let dict_end = bencode_end(info, i)?;
+        let file_dict = &info[i..dict_end];
+        if let Some(len) = bencode_dict_int(file_dict, b"length") {
+            total += len;
+        }
+        i = dict_end;
+    }
+    Some(total)
+}
+
+/// Extract an integer value from a flat bencode dict by key.
+fn bencode_dict_int(dict: &[u8], key: &[u8]) -> Option<i64> {
+    if dict.first() != Some(&b'd') {
+        return None;
+    }
+    let mut i = 1;
+    while i < dict.len() {
+        if dict[i] == b'e' {
+            break;
+        }
+        let key_end = bencode_end(dict, i)?;
+        let colon = dict[i..].iter().position(|&b| b == b':')?;
+        let key_bytes = &dict[i + colon + 1..key_end];
+        let val_end = bencode_end(dict, key_end)?;
+        if key_bytes == key {
+            // Value is bencode integer: i<digits>e
+            if dict.get(key_end) == Some(&b'i') {
+                let e = dict[key_end..].iter().position(|&b| b == b'e')?;
+                let s = std::str::from_utf8(&dict[key_end + 1..key_end + e]).ok()?;
+                return s.parse().ok();
+            }
+        }
+        i = val_end;
+    }
+    None
+}
+
+/// Return the exclusive end index of the bencode value starting at `pos`.
+fn bencode_end(data: &[u8], pos: usize) -> Option<usize> {
+    if pos >= data.len() {
+        return None;
+    }
+    match data[pos] {
+        b'd' | b'l' => {
+            // Dict or list: walk contents until matching 'e'.
+            let mut i = pos + 1;
+            loop {
+                if i >= data.len() {
+                    return None;
+                }
+                if data[i] == b'e' {
+                    return Some(i + 1);
+                }
+                i = bencode_end(data, i)?;
+            }
+        }
+        b'i' => {
+            // Integer: i<digits>e
+            let e = data[pos..].iter().position(|&b| b == b'e')?;
+            Some(pos + e + 1)
+        }
+        b'0'..=b'9' => {
+            // String: <len>:<data>
+            let colon = data[pos..].iter().position(|&b| b == b':')?;
+            let len_str = std::str::from_utf8(&data[pos..pos + colon]).ok()?;
+            let len: usize = len_str.parse().ok()?;
+            Some(pos + colon + 1 + len)
+        }
+        _ => None,
+    }
+}
+
+// ─── Config loader ────────────────────────────────────────────────────────────
+
+fn load_catalogs(spider_name: &str, root: &serde_json::Value) -> serde_json::Value {
+    root.get(spider_name)
+        .and_then(|v| v.get("catalogs"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()))
+}
+
+// ─── Job handlers ─────────────────────────────────────────────────────────────
+
+pub struct TamilMvCrawl;
+
+#[async_trait]
+impl JobHandler for TamilMvCrawl {
+    const QUEUE: &'static str = "spider_tamilmv";
+    const CONCURRENCY: usize = 1;
+    type Args = serde_json::Value;
+
+    async fn run(&self, args: Self::Args, ctx: JobCtx) -> Result<(), JobError> {
+        let (pages, start_page) = parse_listing_page_args(&args);
+        let root = crate::scrapers::scraper_config::load(&ctx.state).await;
+        let homepage = spider_homepage("tamilmv", "https://www.1tamilmv.observer", &root);
+        let catalogs = load_catalogs("tamilmv", &root);
+        scrape_tamil_forum(
+            "tamilmv", "TamilMV", &homepage, &catalogs, pages, start_page, &ctx,
+        )
+        .await
+    }
+}
+
+pub struct TamilBlastersCrawl;
+
+#[async_trait]
+impl JobHandler for TamilBlastersCrawl {
+    const QUEUE: &'static str = "spider_tamil_blasters";
+    const CONCURRENCY: usize = 1;
+    type Args = serde_json::Value;
+
+    async fn run(&self, args: Self::Args, ctx: JobCtx) -> Result<(), JobError> {
+        let (pages, start_page) = parse_listing_page_args(&args);
+        let root = crate::scrapers::scraper_config::load(&ctx.state).await;
+        let homepage = spider_homepage("tamil_blasters", "https://1tamilblasters.wtf", &root);
+        let catalogs = load_catalogs("tamil_blasters", &root);
+        scrape_tamil_forum(
+            "tamil_blasters",
+            "TamilBlasters",
+            &homepage,
+            &catalogs,
+            pages,
+            start_page,
+            &ctx,
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::jobs::handlers::spiders::spider_args::parse_listing_page_args;
+    use serde_json::json;
+
+    use super::{
+        ForumTarget, IpsForumPage, catalog_id_for_target, collect_forum_targets,
+        pagination_rollback_page, parse_ips_forum_page, should_link_catalog,
+    };
+
+    #[test]
+    fn parses_ips_forum_identity_and_effective_page() {
+        assert_eq!(
+            parse_ips_forum_page("https://example.com/forums/forum/49-web-hd-itunes-hd-bluray/"),
+            Some(IpsForumPage {
+                forum_id: 49,
+                page: 1,
+            })
+        );
+        assert_eq!(
+            parse_ips_forum_page(
+                "https://example.com/index.php?/forums/forum/49-web-hd-itunes-hd-bluray/page/1/"
+            ),
+            Some(IpsForumPage {
+                forum_id: 49,
+                page: 1,
+            })
+        );
+        assert_eq!(
+            parse_ips_forum_page(
+                "https://example.com/index.php?/forums/forum/49-slightly-different-slug/page/10/"
+            ),
+            Some(IpsForumPage {
+                forum_id: 49,
+                page: 10,
+            })
+        );
+    }
+
+    #[test]
+    fn valid_listing_page_is_not_a_rollback() {
+        let requested = "https://example.com/index.php?/forums/forum/49-web-hd/page/2/";
+
+        assert_eq!(pagination_rollback_page(requested, requested, 2), None);
+    }
+
+    #[test]
+    fn same_forum_base_url_is_a_page_one_rollback() {
+        let requested = "https://example.com/index.php?/forums/forum/49-web-hd/page/11/";
+        let final_url = "https://example.com/index.php?/forums/forum/49-web-hd/";
+
+        assert_eq!(pagination_rollback_page(requested, final_url, 11), Some(1));
+    }
+
+    #[test]
+    fn same_forum_lower_explicit_page_is_a_rollback() {
+        let requested = "https://example.com/index.php?/forums/forum/49-web-hd/page/11/";
+        let final_url = "https://example.com/index.php?/forums/forum/49-web-hd/page/10/";
+
+        assert_eq!(pagination_rollback_page(requested, final_url, 11), Some(10));
+    }
+
+    #[test]
+    fn scheme_host_and_port_changes_preserve_the_requested_page() {
+        let requested = "http://old.example:8080/index.php?/forums/forum/49-web-hd/page/11/";
+        let final_url = "https://new.example/index.php?/forums/forum/49-web-hd/page/11/";
+
+        assert_eq!(pagination_rollback_page(requested, final_url, 11), None);
+    }
+
+    #[test]
+    fn slug_and_trailing_slash_changes_preserve_the_requested_page() {
+        let requested = "https://example.com/index.php?/forums/forum/49-old-slug/page/11/";
+        let final_url = "https://example.com/index.php?/forums/forum/49-new-slug/page/11";
+
+        assert_eq!(pagination_rollback_page(requested, final_url, 11), None);
+    }
+
+    #[test]
+    fn unrelated_redirect_is_not_a_pagination_rollback() {
+        let requested = "https://example.com/index.php?/forums/forum/49-web-hd/page/11/";
+
+        assert_eq!(
+            pagination_rollback_page(
+                requested,
+                "https://example.com/login/?return=/forums/forum/49-web-hd/",
+                11,
+            ),
+            None
+        );
+        assert_eq!(
+            pagination_rollback_page(
+                requested,
+                "https://example.com/index.php?/forums/forum/50-other-forum/",
+                11,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn page_one_canonical_redirect_is_not_a_rollback() {
+        let requested = "http://old.example/index.php?/forums/forum/49-old-slug/page/1/";
+        let final_url = "https://new.example/index.php?/forums/forum/49-new-slug/";
+
+        assert_eq!(pagination_rollback_page(requested, final_url, 1), None);
+    }
+
+    #[test]
+    fn rollback_detection_is_shared_by_both_tamil_forums() {
+        let cases = [
+            (
+                "https://www.1tamilmv.pizza/index.php?/forums/forum/49-web-hd/page/11/",
+                "https://www.1tamilmv.pizza/index.php?/forums/forum/49-web-hd/",
+            ),
+            (
+                "https://1tamilblasters.example/index.php?/forums/forum/15-tamil-hdrips/page/11/",
+                "https://1tamilblasters.example/index.php?/forums/forum/15-tamil-hdrips/",
+            ),
+        ];
+
+        for (requested, final_url) in cases {
+            assert_eq!(pagination_rollback_page(requested, final_url, 11), Some(1));
+        }
+    }
+
+    #[test]
+    fn rolling_back_one_forum_still_allows_the_next_forum() {
+        let forums = [
+            (
+                49,
+                vec![
+                    (
+                        2,
+                        "https://example.com/index.php?/forums/forum/49-first/page/2/",
+                    ),
+                    (11, "https://example.com/index.php?/forums/forum/49-first/"),
+                ],
+            ),
+            (
+                15,
+                vec![(
+                    2,
+                    "https://example.com/index.php?/forums/forum/15-second/page/2/",
+                )],
+            ),
+        ];
+        let mut processed = Vec::new();
+
+        for (forum_id, pages) in forums {
+            for (page, final_url) in pages {
+                let requested = format!(
+                    "https://example.com/index.php?/forums/forum/{forum_id}-forum/page/{page}/"
+                );
+                if pagination_rollback_page(&requested, final_url, page).is_some() {
+                    break;
+                }
+                processed.push((forum_id, page));
+            }
+        }
+
+        assert_eq!(processed, vec![(49, 2), (15, 2)]);
+    }
+
+    #[test]
+    fn listing_pages_default_to_one() {
+        assert_eq!(parse_listing_page_args(&json!({})), (1, 1));
+    }
+
+    #[test]
+    fn listing_pages_from_args() {
+        assert_eq!(
+            parse_listing_page_args(&json!({"pages": 5, "start_page": 2})),
+            (5, 2)
+        );
+        assert_eq!(parse_listing_page_args(&json!({"total_pages": 3})), (3, 1));
+    }
+
+    #[test]
+    fn listing_pages_clamped() {
+        assert_eq!(parse_listing_page_args(&json!({"pages": 0})), (1, 1));
+        assert_eq!(parse_listing_page_args(&json!({"pages": 999})), (100, 1));
+    }
+
+    #[test]
+    fn collect_forum_targets_preserves_language_and_video_type() {
+        let catalogs = json!({
+            "tamil": {
+                "hdrip": ["11-web-hd", "12-hd-rips"],
+                "series": "19-web-series"
+            },
+            "malayalam": {
+                "tcrip": "35-predvd"
+            }
+        });
+
+        let mut targets = collect_forum_targets(&catalogs);
+        targets.sort_by(|a, b| a.forum_id.cmp(&b.forum_id));
+
+        assert_eq!(
+            targets,
+            vec![
+                ForumTarget {
+                    forum_id: "11-web-hd".into(),
+                    language: "tamil".into(),
+                    video_type: "hdrip".into(),
+                },
+                ForumTarget {
+                    forum_id: "12-hd-rips".into(),
+                    language: "tamil".into(),
+                    video_type: "hdrip".into(),
+                },
+                ForumTarget {
+                    forum_id: "19-web-series".into(),
+                    language: "tamil".into(),
+                    video_type: "series".into(),
+                },
+                ForumTarget {
+                    forum_id: "35-predvd".into(),
+                    language: "malayalam".into(),
+                    video_type: "tcrip".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn catalog_id_for_target_matches_python_catalog_parse_pipeline() {
+        assert_eq!(catalog_id_for_target("Tamil", "hdrip"), "tamil_hdrip");
+        assert_eq!(catalog_id_for_target("english", "series"), "english_series");
+    }
+
+    #[test]
+    fn should_link_catalog_skips_english_without_eng_marker() {
+        assert!(!should_link_catalog(
+            "english",
+            "hdrip",
+            "Avatar (2022) 1080p BluRay"
+        ));
+        assert!(should_link_catalog(
+            "english",
+            "hdrip",
+            "Avatar (2022) 1080p BluRay ENG"
+        ));
+        assert!(!should_link_catalog(
+            "english",
+            "dubbed",
+            "Movie Dual Audio ENG"
+        ));
+        assert!(should_link_catalog("tamil", "hdrip", "Jailer (2023)"));
+    }
+
+    #[test]
+    fn stream_metadata_parsed_from_torrent_name_not_topic_title() {
+        let topic = "Peddi (2026) HD-Rip";
+        let torrent_4k = "www.1TamilMV.report - Peddi (2026) TRUE WEB-DL - 4K SDR - HEVC - [Tam + Tel + Mal + Kan] - (DD+5.1 - 640Kbps & AAC) - 19.5GB - ESub.mkv";
+        let torrent_1080p = "www.1TamilMV.report - Peddi (2026) TRUE WEB-DL - 1080p - AVC - [Tam + Tel + Mal + Kan] - (DD+5.1 - 640Kbps & AAC) - 10GB - ESub.mkv";
+
+        let topic_parsed = crate::parser::parse_title(topic);
+        let parsed_4k = crate::parser::parse_title(torrent_4k);
+        let parsed_1080p = crate::parser::parse_title(torrent_1080p);
+
+        assert_eq!(topic_parsed.title.as_deref(), Some("Peddi"));
+        assert_eq!(parsed_4k.resolution.as_deref(), Some("2160p"));
+        assert_eq!(parsed_1080p.resolution.as_deref(), Some("1080p"));
+        assert_ne!(parsed_4k.resolution, parsed_1080p.resolution);
+    }
+}

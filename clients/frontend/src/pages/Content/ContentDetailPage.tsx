@@ -1,0 +1,2913 @@
+import { streamResourceId, isProxyStream } from '@/lib/streamResource'
+import { ProxyStreamCard } from '@/components/stream/ProxyStreamCard'
+import { MediaStreamImport, type MediaStreamImportHandle } from './MediaStreamImport'
+import { useState, useMemo, useCallback, useRef, useEffect } from 'react'
+import { getContentDetailReturnUrl, getContentDetailReturnLabel } from '@/pages/Library/browseNavigation'
+import { useParams, useSearchParams, Link } from 'react-router-dom'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Skeleton } from '@/components/ui/skeleton'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { ListPagination } from '@/components/ui/list-pagination'
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from '@/components/ui/alert-dialog'
+import {
+  ArrowLeft,
+  Star,
+  Clock,
+  Calendar,
+  Film,
+  Heart,
+  HeartOff,
+  Play,
+  MonitorPlay,
+  Download,
+  Copy,
+  Check,
+  Loader2,
+  Info,
+  Wifi,
+  HardDrive,
+  Ban,
+  Trash2,
+  Hash,
+  Layers,
+  X,
+  EyeOff,
+  ShieldCheck,
+  ShieldOff,
+  CheckCircle,
+  XCircle,
+  Plus,
+} from 'lucide-react'
+import {
+  useCatalogItem,
+  useCatalogStreams,
+  useLibraryCheck,
+  useAddToLibrary,
+  useRemoveFromLibraryByMediaId,
+  useTrackStreamAction,
+  useProfiles,
+  useDeleteEpisodeAdmin,
+  useDeleteSeasonAdmin,
+  useBulkDeleteSeasonsAdmin,
+  useBulkDeleteEpisodesAdmin,
+  useUpdateWatchProgress,
+  useDeleteStream,
+  type CatalogType,
+} from '@/hooks'
+import { StreamCommunityProvider } from '@/contexts/StreamCommunityContext'
+import { ContentLikesProvider } from '@/contexts/ContentLikesContext'
+import { useBlockTorrentStream } from '@/hooks/useAdmin'
+import { useAnnotateFiles } from '@/hooks/useFileLinks'
+import { buildEpisodeAnnotationUpdates } from '@/lib/fileAnnotation'
+import { catalogApi, userMetadataApi, type EpisodeAddRequest, type SeasonAddRequest } from '@/lib/api'
+import { useAuth } from '@/contexts/AuthContext'
+import { useRpdb } from '@/contexts/RpdbContext'
+import { useToast } from '@/hooks/use-toast'
+import type { StreamingProviderInfo, CatalogStreamInfo } from '@/lib/api'
+import { highlightKeywords, keywordBlockTitle } from '@/lib/highlightKeywords'
+import { adminApi } from '@/lib/api/admin'
+import {
+  StreamVoteButtons,
+  StreamReport,
+  StreamCard,
+  StreamFilters,
+  StreamGroupedList,
+  ViewModeToggle,
+  StreamEditSheet,
+  FileAnnotationDialog,
+  StreamRelinkButton,
+  CollectionAnnotationDialog,
+  defaultStreamFilters,
+  type StreamFilterState,
+  type ViewMode,
+  type FileLink,
+  type EditedFileLink,
+} from '@/components/stream'
+import { sortStreams } from '@/components/stream/streamSorting'
+import {
+  MetadataActions,
+  MetadataEditSheet,
+  ContentLikesBadge,
+  RefreshMetadataButton,
+  ScrapeContentButton,
+  ExternalIdsDisplay,
+  BlockContentButton,
+  DeleteContentButton,
+} from '@/components/metadata'
+import { RatingsDisplay, ContentGuidance, SeriesEpisodePicker, TrailerButton } from '@/components/content'
+import { PlayerDialog, ExternalPlayerMenu } from '@/components/player'
+import { Poster, Backdrop } from '@/components/ui/poster'
+import type { ScrapeResponse } from '@/lib/api/scrapers'
+import { scrapersApi } from '@/lib/api/scrapers'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
+
+function SeriesEpisodeCreator({
+  mediaId,
+  seasons,
+  onCreated,
+}: {
+  mediaId: number
+  seasons: { season_number: number; episodes: { episode_number: number }[] }[]
+  onCreated: (season: number, episode?: number) => void
+}) {
+  const { toast } = useToast()
+  const [open, setOpen] = useState(false)
+  const [mode, setMode] = useState<'season' | 'episode'>('season')
+  const [seasonNumber, setSeasonNumber] = useState(() =>
+    String(Math.max(0, ...seasons.map((s) => s.season_number)) + 1),
+  )
+  const [episodeNumber, setEpisodeNumber] = useState('1')
+  const [title, setTitle] = useState('')
+  const mutation = useMutation({
+    mutationFn: async () => {
+      const season = Number(seasonNumber)
+      const episode = Number(episodeNumber)
+      if (!Number.isInteger(season) || season < 0) throw new Error('Enter a valid season number.')
+      if (mode === 'season') {
+        const data: SeasonAddRequest = { season_number: season, name: title.trim() || undefined, episodes: [] }
+        return userMetadataApi.addSeason(mediaId, data)
+      }
+      if (!Number.isInteger(episode) || episode < 1) throw new Error('Enter a valid episode number.')
+      const data: EpisodeAddRequest = {
+        season_number: season,
+        episodes: [{ episode_number: episode, title: title.trim() || `Episode ${episode}` }],
+      }
+      return userMetadataApi.addEpisodes(mediaId, data)
+    },
+    onSuccess: () => {
+      const season = Number(seasonNumber)
+      const episode = mode === 'episode' ? Number(episodeNumber) : undefined
+      toast({ title: mode === 'season' ? 'Season created' : 'Episode created' })
+      setOpen(false)
+      onCreated(season, episode)
+    },
+    onError: (error: Error) => toast({ variant: 'destructive', title: 'Could not save', description: error.message }),
+  })
+  const hasSeasons = seasons.length > 0
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <Button type="button" variant="outline" size="sm" className="gap-1.5 rounded-xl" onClick={() => setOpen(true)}>
+        <Plus className="h-4 w-4" /> Add season or episode
+      </Button>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Add series metadata</DialogTitle>
+          <DialogDescription>
+            Create a missing season or episode. These entries remain editable from this page.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-4 py-2">
+          <div className="flex gap-2">
+            <Button
+              type="button"
+              size="sm"
+              variant={mode === 'season' ? 'default' : 'outline'}
+              onClick={() => setMode('season')}
+            >
+              Season
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant={mode === 'episode' ? 'default' : 'outline'}
+              disabled={!hasSeasons}
+              onClick={() => setMode('episode')}
+            >
+              Episode
+            </Button>
+          </div>
+          <div className="grid gap-2">
+            <Label htmlFor="season-number">Season number</Label>
+            <Input
+              id="season-number"
+              inputMode="numeric"
+              value={seasonNumber}
+              onChange={(event) => setSeasonNumber(event.target.value)}
+            />
+          </div>
+          {mode === 'episode' && (
+            <div className="grid gap-2">
+              <Label htmlFor="episode-number">Episode number</Label>
+              <Input
+                id="episode-number"
+                inputMode="numeric"
+                value={episodeNumber}
+                onChange={(event) => setEpisodeNumber(event.target.value)}
+              />
+            </div>
+          )}
+          <div className="grid gap-2">
+            <Label htmlFor="entry-title">
+              {mode === 'season' ? 'Season name (optional)' : 'Episode title (optional)'}
+            </Label>
+            <Input id="entry-title" value={title} onChange={(event) => setTitle(event.target.value)} />
+          </div>
+          <Button type="button" onClick={() => mutation.mutate()} disabled={mutation.isPending}>
+            {mutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : `Create ${mode}`}
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// Stream Action Dialog Component
+interface StreamActionDialogProps {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  stream: CatalogStreamInfo | null
+  mediaId: number
+  title: string
+  catalogType: 'movie' | 'series' | 'tv'
+  season?: number
+  episode?: number
+  selectedProvider?: string | null // Currently selected provider service name
+  hasMediaflowProxy: boolean // Whether MediaFlow proxy is configured for in-browser playback
+  onStreamDeleted?: () => void
+  onWatch?: (
+    stream: CatalogStreamInfo,
+    streamUrl: string,
+    options?: { useTranscode?: boolean; rawUrl?: string },
+  ) => void // Callback to open player at page level
+}
+
+const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
+  realdebrid: 'Real-Debrid',
+  alldebrid: 'AllDebrid',
+  premiumize: 'Premiumize',
+  debridlink: 'Debrid-Link',
+  torbox: 'TorBox',
+  seedr: 'Seedr',
+  offcloud: 'OffCloud',
+  pikpak: 'PikPak',
+  easydebrid: 'EasyDebrid',
+  debrider: 'Debrider',
+  qbittorrent: 'qBittorrent',
+  stremthru: 'StremThru',
+  torrin: 'Torrin',
+  sabnzbd: 'SABnzbd',
+  nzbget: 'NZBGet',
+  p2p: 'P2P',
+}
+
+function buildTranscodeStreamUrl(streamUrl: string): string {
+  const [urlWithoutHash, hash] = streamUrl.split('#', 2)
+  const [baseUrl, queryString = ''] = urlWithoutHash.split('?', 2)
+  const queryParams = new URLSearchParams(queryString)
+
+  const isTelegramProxyStream = /\/proxy\/telegram\/stream(?:\/[^?#]*)?$/u.test(baseUrl)
+  const isGenericProxyStream = /\/proxy\/stream(?:\/[^?#]*)?$/u.test(baseUrl)
+
+  let transcodeBaseUrl = baseUrl
+  if (isTelegramProxyStream) {
+    transcodeBaseUrl = baseUrl.replace(
+      /\/proxy\/telegram\/stream(?:\/[^?#]*)?$/u,
+      '/proxy/telegram/transcode/playlist.m3u8',
+    )
+    queryParams.delete('transcode')
+  } else if (isGenericProxyStream) {
+    transcodeBaseUrl = baseUrl.replace(/\/proxy\/stream(?:\/[^?#]*)?$/u, '/proxy/transcode/playlist.m3u8')
+    queryParams.delete('transcode')
+  } else {
+    queryParams.set('transcode', 'true')
+  }
+
+  const serializedQuery = queryParams.toString()
+  const rebuiltUrl = serializedQuery ? `${transcodeBaseUrl}?${serializedQuery}` : transcodeBaseUrl
+  return hash ? `${rebuiltUrl}#${hash}` : rebuiltUrl
+}
+
+function canUseTranscode(streamUrl: string): boolean {
+  const [urlWithoutHash] = streamUrl.split('#', 1)
+  const [baseUrl] = urlWithoutHash.split('?', 1)
+
+  // Prefer explicit MediaFlow proxy routes when available.
+  if (/\/proxy\/(stream|telegram\/stream|acestream\/stream)(?:\/[^?#]*)?$/u.test(baseUrl)) {
+    return true
+  }
+
+  // Fallback for addon playback endpoints that support transcode query param.
+  if (/\/(telegram|acestream)\//u.test(baseUrl)) {
+    return true
+  }
+
+  return false
+}
+
+function canOfferTranscodeForStream(stream: CatalogStreamInfo, streamUrl: string): boolean {
+  // Torrent playback can benefit from MediaFlow transcode in browsers.
+  if (stream.stream_type === 'torrent') {
+    return true
+  }
+
+  return canUseTranscode(streamUrl)
+}
+
+function buildYouTubeWatchUrl(videoId: string): string {
+  return `https://www.youtube.com/watch?v=${videoId}`
+}
+
+function NsfwStatusSection({
+  mediaId,
+  score,
+  flagged,
+  reviewed,
+  isAdmin,
+}: {
+  mediaId: number
+  score: number
+  flagged: boolean
+  reviewed: boolean
+  isAdmin: boolean
+}) {
+  const { toast } = useToast()
+  const queryClient = useQueryClient()
+
+  const reviewMutation = useMutation({
+    mutationFn: (newFlagged: boolean) => adminApi.reviewNsfwItem(mediaId, newFlagged),
+    onSuccess: (_, newFlagged) => {
+      toast({
+        title: newFlagged ? 'Confirmed NSFW' : 'Cleared — marked as safe',
+        description: newFlagged ? 'Item will remain hidden from the catalog.' : 'Item is now visible in the catalog.',
+      })
+      queryClient.invalidateQueries({ queryKey: ['catalog'] })
+    },
+    onError: (e: Error) => {
+      toast({ variant: 'destructive', title: 'Review failed', description: e.message })
+    },
+  })
+
+  const pct = Math.round(score * 100)
+
+  return (
+    <div className="pt-4 border-t border-border/30">
+      <p className="text-xs text-muted-foreground mb-2 font-medium">NSFW Poster Detection</p>
+      <div className="flex flex-wrap items-center gap-2">
+        {/* Score badge */}
+        <span
+          className={`inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full border font-medium ${
+            pct >= 80
+              ? 'bg-red-500/15 text-red-400 border-red-500/30'
+              : pct >= 50
+                ? 'bg-orange-500/15 text-orange-400 border-orange-500/30'
+                : 'bg-yellow-500/15 text-yellow-400 border-yellow-500/30'
+          }`}
+        >
+          <EyeOff className="h-3 w-3" />
+          {pct}% NSFW
+        </span>
+
+        {/* Review status */}
+        {reviewed ? (
+          <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full border bg-emerald-500/15 text-emerald-400 border-emerald-500/30 font-medium">
+            <ShieldCheck className="h-3 w-3" />
+            {flagged ? 'Confirmed NSFW' : 'Reviewed — Safe'}
+          </span>
+        ) : (
+          <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full border bg-destructive/15 text-destructive border-destructive/30 font-medium">
+            <EyeOff className="h-3 w-3" />
+            Pending review
+          </span>
+        )}
+
+        {/* Admin review actions */}
+        {isAdmin && !reviewed && (
+          <>
+            <AlertDialog>
+              <AlertDialogTrigger asChild>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-6 px-2 text-xs gap-1 border-destructive/30 text-destructive hover:bg-destructive/10"
+                  disabled={reviewMutation.isPending}
+                >
+                  {reviewMutation.isPending ? (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  ) : (
+                    <XCircle className="h-3 w-3" />
+                  )}
+                  Confirm NSFW
+                </Button>
+              </AlertDialogTrigger>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>Confirm NSFW?</AlertDialogTitle>
+                  <AlertDialogDescription>
+                    Keeps this item hidden from the catalog. The scan job will not re-score it.
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>Cancel</AlertDialogCancel>
+                  <AlertDialogAction
+                    className="bg-destructive hover:bg-destructive/90"
+                    onClick={() => reviewMutation.mutate(true)}
+                  >
+                    Confirm NSFW
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
+
+            <AlertDialog>
+              <AlertDialogTrigger asChild>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-6 px-2 text-xs gap-1 border-emerald-500/30 text-emerald-500 hover:bg-emerald-500/10"
+                  disabled={reviewMutation.isPending}
+                >
+                  {reviewMutation.isPending ? (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  ) : (
+                    <CheckCircle className="h-3 w-3" />
+                  )}
+                  Mark Safe
+                </Button>
+              </AlertDialogTrigger>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>Clear flag?</AlertDialogTitle>
+                  <AlertDialogDescription>
+                    Marks the poster as safe. The item becomes visible in the catalog again.
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>Cancel</AlertDialogCancel>
+                  <AlertDialogAction onClick={() => reviewMutation.mutate(false)}>Mark as Safe</AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
+          </>
+        )}
+
+        {isAdmin && reviewed && (
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-6 px-2 text-xs text-muted-foreground hover:text-foreground"
+            onClick={() => reviewMutation.mutate(!flagged)}
+            disabled={reviewMutation.isPending}
+          >
+            {reviewMutation.isPending ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+            {flagged ? 'Undo — Mark safe' : 'Undo — Mark NSFW'}
+          </Button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function KeywordOverrideSection({
+  mediaId,
+  isOverridden,
+  canOverride,
+  onSuccess,
+}: {
+  mediaId: number
+  isOverridden: boolean
+  canOverride: boolean
+  onSuccess: () => void
+}) {
+  const { toast } = useToast()
+
+  const overrideMutation = useMutation({
+    mutationFn: () => adminApi.toggleKeywordOverride(mediaId),
+    onSuccess: (data) => {
+      toast({
+        title: data.keyword_block_override ? 'Keyword block overridden' : 'Override removed',
+        description: data.message,
+      })
+      onSuccess()
+    },
+    onError: (e: Error) => {
+      toast({ variant: 'destructive', title: 'Action failed', description: e.message })
+    },
+  })
+
+  if (!canOverride) return null
+
+  return (
+    <div className="pt-4 border-t border-border/30">
+      <p className="text-xs text-muted-foreground mb-2 font-medium">Keyword Block Override</p>
+      <div className="flex flex-wrap items-center gap-2">
+        {isOverridden ? (
+          <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full border bg-emerald-500/15 text-emerald-400 border-emerald-500/30 font-medium">
+            <ShieldCheck className="h-3 w-3" />
+            Override Active — Visible to users
+          </span>
+        ) : (
+          <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full border bg-orange-500/15 text-orange-400 border-orange-500/30 font-medium">
+            <ShieldOff className="h-3 w-3" />
+            Keyword blocked
+          </span>
+        )}
+
+        <AlertDialog>
+          <AlertDialogTrigger asChild>
+            <Button
+              size="sm"
+              variant="outline"
+              className={`h-6 px-2 text-xs gap-1 ${
+                isOverridden
+                  ? 'border-orange-500/30 text-orange-400 hover:bg-orange-500/10'
+                  : 'border-emerald-500/30 text-emerald-500 hover:bg-emerald-500/10'
+              }`}
+              disabled={overrideMutation.isPending}
+            >
+              {overrideMutation.isPending ? (
+                <Loader2 className="h-3 w-3 animate-spin" />
+              ) : isOverridden ? (
+                <ShieldOff className="h-3 w-3" />
+              ) : (
+                <ShieldCheck className="h-3 w-3" />
+              )}
+              {isOverridden ? 'Remove Override' : 'Override Keyword Block'}
+            </Button>
+          </AlertDialogTrigger>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>
+                {isOverridden ? 'Remove keyword block override?' : 'Override keyword block?'}
+              </AlertDialogTitle>
+              <AlertDialogDescription>
+                {isOverridden
+                  ? 'This will re-apply the keyword block. The item will be hidden from the catalog again.'
+                  : 'This will suppress the keyword block for this item only. The item will become visible in the catalog despite matching a keyword filter. Use this for false positives.'}
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>Cancel</AlertDialogCancel>
+              <AlertDialogAction
+                className={isOverridden ? 'bg-destructive hover:bg-destructive/90' : ''}
+                onClick={() => overrideMutation.mutate()}
+              >
+                {isOverridden ? 'Remove Override' : 'Override Keyword Block'}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      </div>
+    </div>
+  )
+}
+
+function StreamActionDialog({
+  open,
+  onOpenChange,
+  stream,
+  mediaId,
+  title,
+  catalogType,
+  season,
+  episode,
+  selectedProvider,
+  hasMediaflowProxy,
+  onStreamDeleted,
+  onWatch,
+}: StreamActionDialogProps) {
+  // Check if selected provider is a debrid provider (not P2P)
+  const isDebridProvider = selectedProvider && selectedProvider !== 'p2p'
+  const providerDisplayName = selectedProvider ? PROVIDER_DISPLAY_NAMES[selectedProvider] || selectedProvider : null
+  const [copied, setCopied] = useState(false)
+  const [fileAnnotationOpen, setFileAnnotationOpen] = useState(false)
+  const [collectionAnnotationOpen, setCollectionAnnotationOpen] = useState(false)
+  const [fileLinks, setFileLinks] = useState<FileLink[]>([])
+  const [isLoadingFileLinks, setIsLoadingFileLinks] = useState(false)
+  const [isSavingFileLinks, setIsSavingFileLinks] = useState(false)
+  const trackAction = useTrackStreamAction()
+  const annotateFiles = useAnnotateFiles()
+  const { hasMinimumRole } = useAuth()
+  const isModerator = hasMinimumRole('moderator')
+  const isAdmin = hasMinimumRole('admin')
+
+  // Moderator mutations
+  const blockStream = useBlockTorrentStream()
+  const deleteStream = useDeleteStream()
+  const isDeleting = blockStream.isPending || deleteStream.isPending
+  const isTorrentStream = stream?.stream_type === 'torrent'
+  const torrentAdminStreamId = isTorrentStream ? (stream?.torrent_stream_id ?? stream?.id) : undefined
+
+  const handleBlock = async () => {
+    if (!torrentAdminStreamId) return
+    await blockStream.mutateAsync(torrentAdminStreamId)
+    onOpenChange(false)
+    onStreamDeleted?.()
+  }
+
+  const handleDelete = async () => {
+    if (!stream?.id) return
+    await deleteStream.mutateAsync(stream.id)
+    onOpenChange(false)
+    onStreamDeleted?.()
+  }
+
+  const isYoutubeStream = stream?.stream_type === 'youtube'
+  const youtubeVideoId = stream?.yt_id || stream?.ytId || null
+
+  // Stream URL is pre-resolved from the API; YouTube streams may only provide yt_id/ytId
+  // browser_url is the MediaFlow-wrapped URL for in-browser playback (when web playback is enabled).
+  // url is the raw playback URL used for external players and downloads.
+  const rawStreamUrl =
+    stream?.url || (isYoutubeStream && youtubeVideoId ? buildYouTubeWatchUrl(youtubeVideoId) : undefined)
+  const streamUrl = stream?.browser_url || rawStreamUrl
+
+  // Check if this is a Telegram stream (doesn't require debrid)
+  const isTelegramStream = stream?.stream_type === 'telegram'
+
+  // Check if this is an AceStream stream (doesn't require debrid, uses MediaFlow proxy)
+  const isAceStreamStream = stream?.stream_type === 'acestream'
+  const isUsenetStream = stream?.stream_type === 'usenet'
+
+  // Streams that use MediaFlow proxy directly (no debrid needed)
+  const isDirectProxyStream = isTelegramStream || isAceStreamStream
+  const shouldShowDebridProviderName = Boolean(
+    isDebridProvider && (isTorrentStream || isUsenetStream) && providerDisplayName,
+  )
+  const providerSuffix = shouldShowDebridProviderName ? ` + ${providerDisplayName}` : ''
+  const primaryPlayLabel = isYoutubeStream ? 'Play via YouTube' : `Stream via MediaFlow${providerSuffix}`
+  const transcodePlayLabel = `Play via MediaFlow Transcode${providerSuffix}`
+  const canShowTranscodeOption = Boolean(stream && streamUrl && canOfferTranscodeForStream(stream, streamUrl))
+  const transcodeStreamUrl = canShowTranscodeOption && streamUrl ? buildTranscodeStreamUrl(streamUrl) : null
+
+  const handleWatch = (useTranscode = false) => {
+    if (stream && streamUrl && onWatch) {
+      onOpenChange(false) // Close stream action dialog
+      onWatch(stream, streamUrl, { useTranscode, rawUrl: rawStreamUrl }) // Open player at page level
+    }
+  }
+
+  const handleDownload = () => {
+    if (!stream || !rawStreamUrl) return
+
+    // Open exactly once while the browser still considers this a user gesture.
+    window.open(rawStreamUrl, '_blank')
+    onOpenChange(false)
+    trackAction.mutate({
+      media_id: mediaId,
+      title,
+      catalog_type: catalogType,
+      season,
+      episode,
+      action: 'download',
+      stream_info: {
+        id: stream.id,
+        info_hash: stream.info_hash,
+        name: stream.name,
+        quality: stream.quality,
+        size: stream.size,
+        source: stream.source,
+      },
+    })
+  }
+
+  // File annotation handlers (for series episode link correction)
+  const handleOpenFileAnnotation = async () => {
+    if (!stream?.id) return
+
+    setIsLoadingFileLinks(true)
+    try {
+      const files = await catalogApi.getStreamFiles(stream.id)
+      setFileLinks(
+        files.map((f) => ({
+          file_id: f.file_id,
+          file_name: f.file_name,
+          size: f.size,
+          season_number: f.season_number,
+          episode_number: f.episode_number,
+          episode_end: f.episode_end,
+        })),
+      )
+      setFileAnnotationOpen(true)
+    } catch (error) {
+      console.error('Failed to load file links:', error)
+      if (stream.episode_links && stream.episode_links.length > 0) {
+        setFileLinks(
+          stream.episode_links.map((el) => ({
+            file_id: el.file_id,
+            file_name: el.file_name,
+            season_number: el.season_number ?? null,
+            episode_number: el.episode_number ?? null,
+            episode_end: el.episode_end ?? null,
+          })),
+        )
+        setFileAnnotationOpen(true)
+      }
+    } finally {
+      setIsLoadingFileLinks(false)
+    }
+  }
+
+  const handleSaveFileLinks = async (editedFiles: EditedFileLink[]) => {
+    if (!stream?.id) return
+
+    setIsSavingFileLinks(true)
+    try {
+      const originalFiles =
+        fileLinks.length > 0
+          ? fileLinks
+          : (stream.episode_links || []).map((file) => ({
+              ...file,
+              season_number: file.season_number ?? null,
+              episode_number: file.episode_number ?? null,
+            }))
+      const updates = buildEpisodeAnnotationUpdates(editedFiles, originalFiles)
+      if (updates.length === 0) return
+
+      await annotateFiles.mutateAsync({
+        stream_id: stream.id,
+        media_id: mediaId,
+        updates,
+        reason: `Episode link correction for ${updates.length} files in ${stream.stream_name || stream.name}`,
+      })
+
+      onStreamDeleted?.()
+    } catch (error) {
+      console.error('Failed to save file links:', error)
+      throw error
+    } finally {
+      setIsSavingFileLinks(false)
+    }
+  }
+
+  return (
+    <>
+      <Dialog open={open} onOpenChange={onOpenChange}>
+        <DialogContent
+          className="glass border-border/50 sm:max-w-[500px] overflow-hidden"
+          onOpenAutoFocus={(e) => e.preventDefault()}
+        >
+          <DialogHeader>
+            <DialogTitle>Stream Actions</DialogTitle>
+            <DialogDescription>Choose what to do with this stream</DialogDescription>
+          </DialogHeader>
+
+          {stream && (
+            <div className="space-y-6 py-4 min-w-0">
+              {/* Stream Info */}
+              <div className="space-y-3">
+                <p className="font-medium text-sm line-clamp-2 break-all">
+                  {stream.is_keyword_blocked && stream.matched_keywords?.length
+                    ? highlightKeywords(stream.stream_name || stream.name, stream.matched_keywords)
+                    : stream.stream_name || stream.name}
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  {stream.quality && <Badge variant="secondary">{stream.quality}</Badge>}
+                  {stream.resolution && <Badge variant="outline">{stream.resolution}</Badge>}
+                  {stream.size && (
+                    <Badge variant="outline">
+                      <HardDrive className="mr-1 h-3 w-3" />
+                      {stream.size}
+                    </Badge>
+                  )}
+                  {stream.seeders !== undefined && stream.seeders > 0 && (
+                    <Badge variant="outline" className="text-emerald-500">
+                      <Wifi className="mr-1 h-3 w-3" />
+                      {stream.seeders} seeders
+                    </Badge>
+                  )}
+                  {stream.cached === true && (
+                    <Badge variant="secondary" className="text-yellow-500 bg-yellow-500/10 border-yellow-500/30">
+                      ⚡ Cached
+                    </Badge>
+                  )}
+                  {stream.cached === false && stream.info_hash && (
+                    <Badge variant="outline" className="text-muted-foreground">
+                      Not Cached
+                    </Badge>
+                  )}
+                  {stream.rd_blocked && (
+                    <Badge
+                      variant="outline"
+                      className="border-amber-500/40 text-amber-600 dark:text-amber-400 bg-amber-500/10"
+                      title="RealDebrid does not support this release type (e.g. WEBRip, WEB-DL)."
+                    >
+                      RD block
+                    </Badge>
+                  )}
+                  {stream.is_blocked && (
+                    <Badge
+                      variant="outline"
+                      className="border-red-500/40 text-red-600 dark:text-red-400 bg-red-500/10"
+                      title="Manually blocked stream (admin-only visibility)."
+                    >
+                      Blocked
+                    </Badge>
+                  )}
+                  {stream.is_keyword_blocked && (
+                    <Badge
+                      variant="outline"
+                      className="border-orange-500/40 text-orange-600 dark:text-orange-400 bg-orange-500/10"
+                      title={keywordBlockTitle(stream.matched_keywords)}
+                    >
+                      Keyword Blocked
+                    </Badge>
+                  )}
+                </div>
+              </div>
+
+              {/* Stream Actions Section */}
+              {stream.id && (
+                <div className="space-y-3">
+                  <div className="space-y-2">
+                    <p className="text-xs font-medium text-muted-foreground">Rate this stream</p>
+                    <StreamVoteButtons streamId={stream.id!} showCounts={true} />
+                  </div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <StreamEditSheet
+                      streamId={stream.id!}
+                      streamName={stream.stream_name || stream.name}
+                      currentValues={{
+                        name: stream.stream_name || stream.name,
+                        resolution: stream.resolution,
+                        quality: stream.quality,
+                        codec: stream.codec,
+                        audio_formats: Array.isArray(stream.audio_formats)
+                          ? stream.audio_formats.join('|')
+                          : stream.audio_formats,
+                        hdr_formats: Array.isArray(stream.hdr_formats)
+                          ? stream.hdr_formats.join('|')
+                          : stream.hdr_formats,
+                        source: stream.source,
+                        languages: stream.languages,
+                        size: stream.size,
+                      }}
+                    />
+                    <StreamReport
+                      streamId={stream.id!}
+                      streamName={stream.stream_name || stream.name}
+                      currentQuality={stream.quality || stream.resolution}
+                      currentLanguage={
+                        Array.isArray(stream.audio_formats) ? stream.audio_formats.join('|') : stream.audio_formats
+                      }
+                      isBlocked={stream.is_blocked}
+                    />
+                    {/* File Annotation for Series */}
+                    {catalogType === 'series' && stream.episode_links && stream.episode_links.length > 0 && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={handleOpenFileAnnotation}
+                        disabled={isLoadingFileLinks}
+                        className="gap-1.5"
+                      >
+                        {isLoadingFileLinks ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <Hash className="h-4 w-4" />
+                        )}
+                        Annotate Files ({stream.episode_links.length})
+                      </Button>
+                    )}
+                    {/* Collection Annotation for multi-file torrents */}
+                    {stream.episode_links && stream.episode_links.length > 1 && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setCollectionAnnotationOpen(true)}
+                        className="gap-1.5"
+                      >
+                        <Layers className="h-4 w-4" />
+                        Collection ({stream.episode_links.length})
+                      </Button>
+                    )}
+                    {/* Stream Re-linking */}
+                    <StreamRelinkButton
+                      streamId={stream.id!}
+                      streamName={stream.stream_name || stream.name}
+                      currentMediaId={mediaId}
+                      currentMediaTitle={title}
+                      variant="button"
+                    />
+                  </div>
+
+                  {/* Moderator Actions */}
+                  {isModerator && stream?.id && (
+                    <div className="pt-2 mt-2 border-t border-border/50">
+                      <p className="text-xs font-medium text-muted-foreground mb-2">Moderator Actions</p>
+                      <div className="flex items-center gap-2">
+                        {isTorrentStream && torrentAdminStreamId && (
+                          <AlertDialog>
+                            <AlertDialogTrigger asChild>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                className="text-primary hover:text-primary/80 hover:bg-primary/5 dark:hover:bg-primary/10"
+                                disabled={isDeleting}
+                              >
+                                {blockStream.isPending ? (
+                                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                ) : (
+                                  <Ban className="mr-2 h-4 w-4" />
+                                )}
+                                Block Stream
+                              </Button>
+                            </AlertDialogTrigger>
+                            <AlertDialogContent>
+                              <AlertDialogHeader>
+                                <AlertDialogTitle>Block this stream?</AlertDialogTitle>
+                                <AlertDialogDescription>
+                                  This will block the stream from appearing in search results. The stream can be
+                                  unblocked later from the admin panel.
+                                </AlertDialogDescription>
+                              </AlertDialogHeader>
+                              <AlertDialogFooter>
+                                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                                <AlertDialogAction onClick={handleBlock} className="bg-primary hover:bg-primary/90">
+                                  Block Stream
+                                </AlertDialogAction>
+                              </AlertDialogFooter>
+                            </AlertDialogContent>
+                          </AlertDialog>
+                        )}
+
+                        <AlertDialog>
+                          <AlertDialogTrigger asChild>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="text-red-600 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-500/10"
+                              disabled={isDeleting}
+                            >
+                              {deleteStream.isPending ? (
+                                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                              ) : (
+                                <Trash2 className="mr-2 h-4 w-4" />
+                              )}
+                              Delete Stream
+                            </Button>
+                          </AlertDialogTrigger>
+                          <AlertDialogContent>
+                            <AlertDialogHeader>
+                              <AlertDialogTitle>Delete this stream?</AlertDialogTitle>
+                              <AlertDialogDescription>
+                                This action cannot be undone. The stream will be permanently deleted from the database.
+                              </AlertDialogDescription>
+                            </AlertDialogHeader>
+                            <AlertDialogFooter>
+                              <AlertDialogCancel>Cancel</AlertDialogCancel>
+                              <AlertDialogAction onClick={handleDelete} className="bg-red-600 hover:bg-red-700">
+                                Delete Stream
+                              </AlertDialogAction>
+                            </AlertDialogFooter>
+                          </AlertDialogContent>
+                        </AlertDialog>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Actions */}
+              <div className="grid gap-3">
+                {stream.rd_blocked && (
+                  <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/20 text-sm">
+                    <p className="text-amber-600 dark:text-amber-400 font-medium mb-1">RealDebrid blocked</p>
+                    <p className="text-muted-foreground text-xs">
+                      RealDebrid rejects this filename pattern (e.g. WEBRip, WEB-DL), so it is hidden from Stremio. You
+                      can still attempt playback here, or switch to another debrid provider above.
+                    </p>
+                  </div>
+                )}
+                {isAdmin && (stream.is_blocked || stream.is_keyword_blocked) && (
+                  <div className="p-3 rounded-xl bg-orange-500/10 border border-orange-500/20 text-sm">
+                    <p className="text-orange-600 dark:text-orange-400 font-medium mb-1">Restricted stream</p>
+                    <p className="text-muted-foreground text-xs">
+                      This stream is hidden from regular users. Playback is enabled for admin review.
+                    </p>
+                  </div>
+                )}
+                {streamUrl && (isDebridProvider || isDirectProxyStream || isYoutubeStream) ? (
+                  <>
+                    {/* In-browser playback - requires MediaFlow proxy AND debrid for all streams */}
+                    {hasMediaflowProxy || isDirectProxyStream || isYoutubeStream ? (
+                      <>
+                        <div className={canShowTranscodeOption ? 'grid grid-cols-1 sm:grid-cols-2 gap-2' : ''}>
+                          <Button
+                            onClick={() => handleWatch(false)}
+                            className="rounded-xl bg-gradient-to-r from-primary to-primary/80 hover:from-primary/90 hover:to-primary/70 min-w-0 w-full"
+                            disabled={trackAction.isPending}
+                            title={primaryPlayLabel}
+                          >
+                            <MonitorPlay className="mr-2 h-4 w-4 shrink-0" />
+                            <span className="truncate">{primaryPlayLabel}</span>
+                          </Button>
+
+                          {canShowTranscodeOption && transcodeStreamUrl && (
+                            <Button
+                              variant="outline"
+                              onClick={() => handleWatch(true)}
+                              className="rounded-xl min-w-0 w-full"
+                              disabled={trackAction.isPending}
+                              title={transcodePlayLabel}
+                            >
+                              <MonitorPlay className="mr-2 h-4 w-4 shrink-0" />
+                              <span className="truncate">{transcodePlayLabel}</span>
+                            </Button>
+                          )}
+                        </div>
+
+                        {/* External Players */}
+                        <ExternalPlayerMenu
+                          streamUrl={rawStreamUrl || streamUrl}
+                          mediaflowUrl={
+                            stream?.browser_url && stream.browser_url !== stream.url ? stream.browser_url : undefined
+                          }
+                          className="rounded-xl justify-center w-full"
+                        />
+                      </>
+                    ) : (
+                      <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/20 text-sm">
+                        <p className="text-amber-600 dark:text-amber-400 font-medium mb-1">
+                          Web Browser Playback Disabled
+                        </p>
+                        <p className="text-muted-foreground text-xs">
+                          To play streams in your browser, go to Configure → External Services → MediaFlow and enable
+                          "Enable Web Browser Playback". MediaFlow proxy is required for browser playback due to CORS
+                          restrictions.
+                        </p>
+                      </div>
+                    )}
+
+                    <div className="grid grid-cols-2 gap-2">
+                      <Button
+                        variant={hasMediaflowProxy ? 'outline' : 'default'}
+                        onClick={handleDownload}
+                        className={
+                          hasMediaflowProxy
+                            ? 'rounded-xl min-w-0'
+                            : 'rounded-xl min-w-0 bg-gradient-to-r from-primary to-primary/80 hover:from-primary/90 hover:to-primary/70'
+                        }
+                        disabled={trackAction.isPending}
+                      >
+                        <Download className="mr-2 h-4 w-4 shrink-0" />
+                        <span className="truncate">Download</span>
+                      </Button>
+
+                      <Button
+                        variant="outline"
+                        onClick={async () => {
+                          // For torrent streams, copy info hash; for HTTP streams, copy raw URL
+                          const textToCopy =
+                            isTorrentStream && stream.info_hash ? stream.info_hash : rawStreamUrl || streamUrl
+                          await navigator.clipboard.writeText(textToCopy)
+                          setCopied(true)
+                          setTimeout(() => setCopied(false), 2000)
+                        }}
+                        className="rounded-xl min-w-0"
+                        disabled={trackAction.isPending}
+                      >
+                        {copied ? (
+                          <>
+                            <Check className="mr-2 h-4 w-4 shrink-0 text-emerald-500" />
+                            <span className="truncate">Copied</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="mr-2 h-4 w-4 shrink-0" />
+                            <span className="truncate">
+                              {isTorrentStream && stream.info_hash ? 'Copy Info Hash' : 'Copy Stream URL'}
+                            </span>
+                          </>
+                        )}
+                      </Button>
+                    </div>
+
+                    {/* External Players - show prominently when no MediaFlow */}
+                    {!hasMediaflowProxy && (
+                      <ExternalPlayerMenu
+                        streamUrl={rawStreamUrl || streamUrl}
+                        mediaflowUrl={
+                          stream?.browser_url && stream.browser_url !== stream.url ? stream.browser_url : undefined
+                        }
+                        className="rounded-xl justify-center w-full"
+                      />
+                    )}
+                  </>
+                ) : (
+                  <>
+                    {/* Telegram/AceStream streams don't need debrid - show play button */}
+                    {isDirectProxyStream && streamUrl ? (
+                      <>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                          <Button
+                            onClick={() => handleWatch(false)}
+                            className="rounded-xl bg-gradient-to-r from-primary to-primary/80 hover:from-primary/90 hover:to-primary/70 min-w-0 w-full"
+                            disabled={trackAction.isPending}
+                            title={primaryPlayLabel}
+                          >
+                            <MonitorPlay className="mr-2 h-4 w-4 shrink-0" />
+                            <span className="truncate">{primaryPlayLabel}</span>
+                          </Button>
+                          {transcodeStreamUrl && (
+                            <Button
+                              variant="outline"
+                              onClick={() => handleWatch(true)}
+                              className="rounded-xl min-w-0 w-full"
+                              disabled={trackAction.isPending}
+                              title={transcodePlayLabel}
+                            >
+                              <MonitorPlay className="mr-2 h-4 w-4 shrink-0" />
+                              <span className="truncate">{transcodePlayLabel}</span>
+                            </Button>
+                          )}
+                        </div>
+
+                        {/* External Players */}
+                        <ExternalPlayerMenu
+                          streamUrl={rawStreamUrl || streamUrl}
+                          mediaflowUrl={
+                            stream?.browser_url && stream.browser_url !== stream.url ? stream.browser_url : undefined
+                          }
+                          className="rounded-xl justify-center w-full"
+                        />
+
+                        <div className="grid grid-cols-2 gap-2">
+                          <Button
+                            variant="outline"
+                            onClick={handleDownload}
+                            className="rounded-xl min-w-0"
+                            disabled={trackAction.isPending}
+                          >
+                            <Download className="mr-2 h-4 w-4 shrink-0" />
+                            <span className="truncate">Download</span>
+                          </Button>
+
+                          <Button
+                            variant="outline"
+                            onClick={async () => {
+                              await navigator.clipboard.writeText(rawStreamUrl || streamUrl)
+                              setCopied(true)
+                              setTimeout(() => setCopied(false), 2000)
+                            }}
+                            className="rounded-xl min-w-0"
+                            disabled={trackAction.isPending}
+                          >
+                            {copied ? (
+                              <>
+                                <Check className="mr-2 h-4 w-4 shrink-0 text-emerald-500" />
+                                <span className="truncate">Copied</span>
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="mr-2 h-4 w-4 shrink-0" />
+                                <span className="truncate">Copy URL</span>
+                              </>
+                            )}
+                          </Button>
+                        </div>
+                      </>
+                    ) : isTorrentStream && stream.info_hash ? (
+                      <>
+                        {/* No debrid configured or no URL - show info hash for torrents */}
+                        <Button
+                          onClick={async () => {
+                            await navigator.clipboard.writeText(stream.info_hash!)
+                            setCopied(true)
+                            setTimeout(() => setCopied(false), 2000)
+                          }}
+                          className="rounded-xl bg-gradient-to-r from-primary to-primary/80 hover:from-primary/90 hover:to-primary/70"
+                        >
+                          {copied ? (
+                            <>
+                              <Check className="mr-2 h-4 w-4" />
+                              Copied!
+                            </>
+                          ) : (
+                            <>
+                              <Copy className="mr-2 h-4 w-4" />
+                              Copy Info Hash
+                            </>
+                          )}
+                        </Button>
+                        <p className="text-xs text-center text-muted-foreground">
+                          {isDebridProvider
+                            ? 'Stream is being processed. Copy the info hash to use with your debrid provider.'
+                            : 'Configure a debrid provider to enable direct streaming and downloads.'}
+                        </p>
+                      </>
+                    ) : rawStreamUrl ? (
+                      <>
+                        {/* HTTP stream without debrid - show URL copy option */}
+                        <Button
+                          onClick={async () => {
+                            await navigator.clipboard.writeText(rawStreamUrl)
+                            setCopied(true)
+                            setTimeout(() => setCopied(false), 2000)
+                          }}
+                          className="rounded-xl bg-gradient-to-r from-primary to-primary/80 hover:from-primary/90 hover:to-primary/70"
+                        >
+                          {copied ? (
+                            <>
+                              <Check className="mr-2 h-4 w-4" />
+                              Copied!
+                            </>
+                          ) : (
+                            <>
+                              <Copy className="mr-2 h-4 w-4" />
+                              Copy Stream URL
+                            </>
+                          )}
+                        </Button>
+                        <p className="text-xs text-center text-muted-foreground">
+                          Configure a debrid provider with MediaFlow to enable in-browser playback.
+                        </p>
+                      </>
+                    ) : (
+                      <p className="text-xs text-center text-muted-foreground">
+                        No stream URL available. Configure a debrid provider to access this stream.
+                      </p>
+                    )}
+                  </>
+                )}
+              </div>
+
+              {/* Info */}
+              <div className="flex items-start gap-2 p-3 rounded-xl bg-muted/50 text-sm text-muted-foreground">
+                <Info className="h-4 w-4 mt-0.5 flex-shrink-0" />
+                <p>
+                  {stream.rd_blocked
+                    ? streamUrl
+                      ? 'Hidden from Stremio because RealDebrid rejects this filename pattern. You can attempt playback here or switch debrid provider above.'
+                      : 'Hidden from Stremio because RealDebrid rejects this filename pattern. Configure a debrid provider to play from the web UI.'
+                    : streamUrl && (isDebridProvider || isDirectProxyStream || isYoutubeStream)
+                      ? hasMediaflowProxy || isDirectProxyStream || isYoutubeStream
+                        ? isYoutubeStream
+                          ? "Click 'Play via YouTube' to watch in embedded YouTube player."
+                          : isDirectProxyStream
+                            ? isAceStreamStream
+                              ? "Click 'Stream via MediaFlow' to play via MediaFlow Proxy (AceStream)."
+                              : "Click 'Stream via MediaFlow' to play via MediaFlow Proxy (using your Telegram session)."
+                            : "Click 'Stream via MediaFlow' to play in browser, or 'Download' to open in a new tab."
+                        : "Use 'Download' to open in a new tab or use an external player. Enable 'Web Browser Playback' in External Services for in-browser playback."
+                      : isTorrentStream
+                        ? isDebridProvider
+                          ? 'The stream URL will be available once your debrid provider processes the torrent.'
+                          : 'Configure a debrid provider to access this torrent stream.'
+                        : 'Configure a debrid provider and enable Web Browser Playback to stream.'}
+                </p>
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* File Annotation Dialog for Series */}
+      {stream && catalogType === 'series' && (
+        <FileAnnotationDialog
+          open={fileAnnotationOpen}
+          onOpenChange={setFileAnnotationOpen}
+          streamId={stream.id}
+          currentResolution={stream.resolution}
+          streamName={stream.stream_name || stream.name}
+          initialFiles={fileLinks}
+          onSave={handleSaveFileLinks}
+          isLoading={isSavingFileLinks}
+        />
+      )}
+
+      {/* Collection Annotation Dialog for multi-file torrents */}
+      {stream && stream.episode_links && stream.episode_links.length > 1 && (
+        <CollectionAnnotationDialog
+          open={collectionAnnotationOpen}
+          onOpenChange={setCollectionAnnotationOpen}
+          streamId={stream.id!}
+          currentResolution={stream.resolution}
+          streamName={stream.stream_name || stream.name}
+          files={stream.episode_links.map((el) => ({
+            file_id: el.file_id,
+            file_name: el.file_name,
+            file_index: undefined, // File IDs are not physical torrent indexes.
+          }))}
+        />
+      )}
+    </>
+  )
+}
+
+// Service name display mapping
+const SERVICE_DISPLAY_NAMES: Record<string, string> = {
+  realdebrid: 'Real-Debrid',
+  alldebrid: 'AllDebrid',
+  premiumize: 'Premiumize',
+  debridlink: 'Debrid-Link',
+  torbox: 'TorBox',
+  seedr: 'Seedr',
+  offcloud: 'OffCloud',
+  pikpak: 'PikPak',
+  easydebrid: 'EasyDebrid',
+  debrider: 'Debrider',
+  qbittorrent: 'qBittorrent',
+  stremthru: 'StremThru',
+  torrin: 'Torrin',
+  p2p: 'P2P',
+}
+
+// Helper to get display name for a provider - shows both custom name and service
+function getProviderDisplayName(provider: StreamingProviderInfo): string {
+  const serviceName = SERVICE_DISPLAY_NAMES[provider.service] || provider.service
+
+  // If user has a custom name, show both: "Custom Name (Service)"
+  if (provider.name && provider.name !== serviceName) {
+    return `${provider.name} (${serviceName})`
+  }
+
+  // Otherwise just show the service name
+  return serviceName
+}
+
+// Main Content Detail Page
+export function ContentDetailPage() {
+  const mediaImportRef = useRef<MediaStreamImportHandle>(null)
+  const [isImportBusy, setIsImportBusy] = useState(false)
+  const { type, id } = useParams<{ type: string; id: string }>()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const catalogType = type as CatalogType
+  const { isAuthenticated, hasMinimumRole } = useAuth()
+  const { rpdbApiKey } = useRpdb()
+  const { toast } = useToast()
+  const mediaId = parseInt(id || '0', 10)
+  const isModerator = hasMinimumRole('moderator')
+  const isAdmin = hasMinimumRole('admin')
+
+  // Read initial season/episode from URL query params (for deep linking from history)
+  const initialSeason = searchParams.get('season') ? parseInt(searchParams.get('season')!, 10) : undefined
+  const initialEpisode = searchParams.get('episode') ? parseInt(searchParams.get('episode')!, 10) : undefined
+
+  // When navigated from Discover, scraping will be auto-triggered — show a banner with progress/result
+  const [scrapingBanner, setScrapingBanner] = useState(() => searchParams.get('scraping') === '1')
+  const [scrapeResult, setScrapeResult] = useState<ScrapeResponse | null>(null)
+  const queryClient = useQueryClient()
+
+  // For series: season and episode selection
+  const [selectedSeason, setSelectedSeason] = useState<number | undefined>(initialSeason)
+  const [selectedEpisode, setSelectedEpisode] = useState<number | undefined>(initialEpisode)
+  const [streamDialogOpen, setStreamDialogOpen] = useState(false)
+  const [selectedStream, setSelectedStream] = useState<CatalogStreamInfo | null>(null)
+
+  // Auto-scrape mutation: triggered on mount when navigated from Discover (?scraping=1)
+  const autoScrapeMutation = useMutation({
+    mutationFn: () =>
+      scrapersApi.triggerScrape(mediaId, {
+        media_type: catalogType === 'series' ? 'series' : 'movie',
+        ...(catalogType === 'series' && initialSeason !== undefined && initialEpisode !== undefined
+          ? { season: initialSeason, episode: initialEpisode }
+          : catalogType === 'series'
+            ? { season: 1, episode: 1 }
+            : {}),
+      }),
+    onSuccess: (data) => {
+      setScrapeResult(data)
+      if (data.streams_found > 0) {
+        queryClient.invalidateQueries({ queryKey: ['catalog', 'streams', catalogType, mediaId.toString()] })
+      }
+    },
+  })
+
+  const scrapeTriggered = useRef(false)
+  useEffect(() => {
+    if (scrapingBanner && !scrapeTriggered.current) {
+      scrapeTriggered.current = true
+      autoScrapeMutation.mutate()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Stream filtering and view mode (stream_id query param deep-links to a single stream)
+  const [streamFilters, setStreamFilters] = useState<StreamFilterState>(() => ({
+    ...defaultStreamFilters,
+    streamIdFilter: searchParams.get('stream_id') || '',
+  }))
+  const [autoOpenedStreamId, setAutoOpenedStreamId] = useState<string | null>(null)
+  const hasStreamDeepLink = streamFilters.streamIdFilter.length > 0
+  const [viewMode, setViewMode] = useState<ViewMode>('list')
+  const [streamPage, setStreamPage] = useState(1)
+  const [streamPageSize, setStreamPageSize] = useState<25 | 50 | 100>(50)
+
+  // Player state (hoisted from StreamActionDialog for proper modal layering)
+  const [playerOpen, setPlayerOpen] = useState(false)
+  const [playerStream, setPlayerStream] = useState<CatalogStreamInfo | null>(null)
+  const [playerStreamUrl, setPlayerStreamUrl] = useState<string | null>(null)
+  const [playerExternalStreamUrl, setPlayerExternalStreamUrl] = useState<string | null>(null)
+  const [playerTranscodeStreamUrl, setPlayerTranscodeStreamUrl] = useState<string | null>(null)
+  const [isPlayingTranscodedStream, setIsPlayingTranscodedStream] = useState(false)
+
+  // Watch history tracking for resume playback
+  const [watchHistoryId, setWatchHistoryId] = useState<number | null>(null)
+  const [startTime, setStartTime] = useState(0)
+  const lastProgressUpdateRef = useRef<number>(0) // Track last update time for throttling
+  const watchTrackingStartedRef = useRef(false)
+  const trackAction = useTrackStreamAction()
+  const updateProgress = useUpdateWatchProgress()
+
+  // Last played stream tracking
+  const getLastPlayedKey = useCallback(() => {
+    // Create a unique key based on media ID and optionally season/episode for series
+    if (catalogType === 'series' && selectedSeason !== undefined && selectedEpisode !== undefined) {
+      return `mf:lastPlayed:${mediaId}:${selectedSeason}:${selectedEpisode}`
+    }
+    return `mf:lastPlayed:${mediaId}`
+  }, [mediaId, catalogType, selectedSeason, selectedEpisode])
+
+  const [lastPlayedStreamId, setLastPlayedStreamId] = useState<string | null>(() => {
+    // Initialize from localStorage
+    if (typeof window === 'undefined') return null
+    const key = `mf:lastPlayed:${mediaId}` // Initial key without season/episode
+    return localStorage.getItem(key)
+  })
+
+  // Update lastPlayedStreamId when season/episode changes (during render, not in effect)
+  const lastPlayedKey = getLastPlayedKey()
+  const [prevLastPlayedKey, setPrevLastPlayedKey] = useState(lastPlayedKey)
+  if (lastPlayedKey !== prevLastPlayedKey) {
+    setPrevLastPlayedKey(lastPlayedKey)
+    const stored = localStorage.getItem(lastPlayedKey)
+    setLastPlayedStreamId(stored)
+  }
+
+  // Profile and provider selection for streams
+  const [selectedProfileId, setSelectedProfileId] = useState<number | undefined>()
+  const [selectedProfileUuid, setSelectedProfileUuid] = useState<string | undefined>()
+  const [selectedProvider, setSelectedProvider] = useState<string | undefined>()
+
+  // Fetch user profiles
+  const { data: profiles } = useProfiles()
+
+  // Find default profile and set both profile ID and primary provider initially (during render, not in effect)
+  // Note: We only guard on selectedProfileId === undefined (not prev reference equality)
+  // because when profiles are already cached, useState(profiles) initializes to the same
+  // reference, making prevProfiles !== profiles always false and blocking initialization.
+  if (profiles && profiles.length > 0 && selectedProfileId === undefined) {
+    const defaultProfile = profiles.find((p) => p.is_default) || profiles[0]
+    setSelectedProfileId(defaultProfile.id)
+    setSelectedProfileUuid(defaultProfile.uuid)
+    const primaryService =
+      defaultProfile.streaming_providers?.primary_service || defaultProfile.streaming_providers?.providers?.[0]?.service
+    // Default to 'p2p' when no streaming provider is configured so streams still load
+    setSelectedProvider(primaryService || 'p2p')
+  }
+
+  // Fetch data
+  const { data: item, isLoading, refetch: refetchCatalogItem } = useCatalogItem(catalogType, mediaId)
+  const { data: libraryStatus } = useLibraryCheck(mediaId)
+
+  // Use the Stremio catalog streams API (handles debrid, caching, user preferences)
+  // Only fetch when we have BOTH profile ID and provider to make a single optimized request
+  const {
+    data: streamsData,
+    isLoading: streamsLoading,
+    refetch: refetchStreams,
+  } = useCatalogStreams(
+    catalogType,
+    mediaId,
+    selectedSeason,
+    selectedEpisode,
+    selectedProfileId,
+    selectedProvider,
+    {
+      enabled:
+        isAuthenticated &&
+        !!item &&
+        selectedProfileId !== undefined && // Wait for profile to be selected
+        selectedProvider !== undefined && // Wait for provider to be selected
+        (catalogType === 'movie' ||
+          catalogType === 'tv' ||
+          (selectedSeason !== undefined && selectedEpisode !== undefined) ||
+          hasStreamDeepLink),
+      resourceId: streamResourceId(mediaId, item?.external_ids),
+      streamId: hasStreamDeepLink ? streamFilters.streamIdFilter : undefined,
+    },
+    selectedProfileUuid,
+  )
+
+  // Get available providers from the streams response (memoized to avoid unstable deps)
+  const availableProviders = useMemo(() => streamsData?.streaming_providers || [], [streamsData?.streaming_providers])
+
+  // Update provider selection when providers list changes (during render, not in effect)
+  const [prevProviders, setPrevProviders] = useState(availableProviders)
+  if (availableProviders.length > 0 && selectedProvider && prevProviders !== availableProviders) {
+    setPrevProviders(availableProviders)
+    const stillValid = availableProviders.some((p) => p.service === selectedProvider)
+    if (!stillValid) {
+      setSelectedProvider(availableProviders[0].service)
+    }
+  }
+
+  // Library mutations
+  const addToLibrary = useAddToLibrary()
+  const removeFromLibrary = useRemoveFromLibraryByMediaId()
+
+  // Episode delete mutation (moderator only)
+  const deleteEpisodeAdmin = useDeleteEpisodeAdmin()
+  const deleteSeasonAdmin = useDeleteSeasonAdmin()
+  const bulkDeleteSeasonsAdmin = useBulkDeleteSeasonsAdmin()
+  const bulkDeleteEpisodesAdmin = useBulkDeleteEpisodesAdmin()
+
+  // Handle episode deletion (moderator only)
+  // seasonNumber and episodeNumber are passed from SeriesEpisodePicker for potential toast messages
+  const handleDeleteEpisode = async (episodeId: number, _seasonNumber: number, _episodeNumber: number) => {
+    if (!item?.id) return
+    try {
+      await deleteEpisodeAdmin.mutateAsync({ mediaId: item.id, episodeId })
+      await refetchCatalogItem()
+    } catch (error) {
+      console.error('Failed to delete episode:', error)
+      throw error
+    }
+  }
+
+  const handleDeleteSeason = async (seasonNumber: number) => {
+    if (!item?.id) return
+    try {
+      await deleteSeasonAdmin.mutateAsync({ mediaId: item.id, seasonNumber })
+      const { data: refreshed } = await refetchCatalogItem()
+      const nextSeasons = refreshed?.seasons ?? []
+      const nextSeason = nextSeasons[0]?.season_number
+      if (
+        selectedSeason === seasonNumber ||
+        (selectedSeason !== undefined && !nextSeasons.some((s) => s.season_number === selectedSeason))
+      ) {
+        setSelectedSeason(nextSeason)
+        setSelectedEpisode(undefined)
+        setSearchParams(
+          (prev) => {
+            const params = new URLSearchParams(prev)
+            if (nextSeason !== undefined) {
+              params.set('season', String(nextSeason))
+              params.delete('episode')
+            } else {
+              params.delete('season')
+              params.delete('episode')
+            }
+            return params
+          },
+          { replace: true },
+        )
+      }
+      toast({
+        title: 'Season deleted',
+        description: `Season ${seasonNumber} was removed successfully.`,
+      })
+    } catch (error) {
+      console.error('Failed to delete season:', error)
+      toast({
+        title: 'Failed to delete season',
+        description: error instanceof Error ? error.message : 'Please try again.',
+        variant: 'destructive',
+      })
+      throw error
+    }
+  }
+
+  const handleBulkDeleteSeasons = async (seasonNumbers: number[]) => {
+    if (!item?.id || seasonNumbers.length === 0) return
+    try {
+      const result = await bulkDeleteSeasonsAdmin.mutateAsync({
+        mediaId: item.id,
+        seasonNumbers,
+      })
+      const { data: refreshed } = await refetchCatalogItem()
+      const nextSeasons = refreshed?.seasons ?? []
+      const nextSeason = nextSeasons[0]?.season_number
+      if (
+        selectedSeason !== undefined &&
+        (seasonNumbers.includes(selectedSeason) || !nextSeasons.some((s) => s.season_number === selectedSeason))
+      ) {
+        setSelectedSeason(nextSeason)
+        setSelectedEpisode(undefined)
+        setSearchParams(
+          (prev) => {
+            const params = new URLSearchParams(prev)
+            if (nextSeason !== undefined) {
+              params.set('season', String(nextSeason))
+              params.delete('episode')
+            } else {
+              params.delete('season')
+              params.delete('episode')
+            }
+            return params
+          },
+          { replace: true },
+        )
+      }
+      toast({
+        title: 'Seasons deleted',
+        description: `Removed ${result.deleted} season${result.deleted === 1 ? '' : 's'}${
+          result.failed > 0 ? ` (${result.failed} failed)` : ''
+        }.`,
+      })
+    } catch (error) {
+      console.error('Failed to bulk delete seasons:', error)
+      toast({
+        title: 'Failed to delete seasons',
+        description: error instanceof Error ? error.message : 'Please try again.',
+        variant: 'destructive',
+      })
+      throw error
+    }
+  }
+
+  const handleBulkDeleteEpisodes = async (episodeIds: number[]) => {
+    if (!item?.id || episodeIds.length === 0) return
+    try {
+      const result = await bulkDeleteEpisodesAdmin.mutateAsync({
+        mediaId: item.id,
+        episodeIds,
+      })
+      await refetchCatalogItem()
+      setSelectedEpisode(undefined)
+      setSearchParams(
+        (prev) => {
+          const params = new URLSearchParams(prev)
+          params.delete('episode')
+          return params
+        },
+        { replace: true },
+      )
+      toast({
+        title: 'Episodes deleted',
+        description: `Removed ${result.deleted} episode${result.deleted === 1 ? '' : 's'}${
+          result.failed > 0 ? ` (${result.failed} failed)` : ''
+        }.`,
+      })
+    } catch (error) {
+      console.error('Failed to bulk delete episodes:', error)
+      toast({
+        title: 'Failed to delete episodes',
+        description: error instanceof Error ? error.message : 'Please try again.',
+        variant: 'destructive',
+      })
+      throw error
+    }
+  }
+
+  const handleEpisodeEditSuccess = async () => {
+    await refetchCatalogItem()
+    toast({
+      title: 'Episode edit submitted',
+      description: 'Your episode changes were submitted and the list has been refreshed.',
+    })
+  }
+
+  // Calculate available seasons and episodes
+  const seasons = useMemo(() => item?.seasons ?? [], [item?.seasons])
+
+  const episodes = useMemo(() => {
+    if (selectedSeason === undefined || !seasons.length) return []
+    const season = seasons.find((s) => s.season_number === selectedSeason)
+    return season?.episodes ?? []
+  }, [selectedSeason, seasons])
+
+  // Sync URL params to state when they change (during render, not in effect)
+  const [prevInitialSeason, setPrevInitialSeason] = useState(initialSeason)
+  const [prevInitialEpisode, setPrevInitialEpisode] = useState(initialEpisode)
+  if (initialSeason !== undefined && prevInitialSeason !== initialSeason) {
+    setPrevInitialSeason(initialSeason)
+    setSelectedSeason(initialSeason)
+  }
+  if (initialEpisode !== undefined && prevInitialEpisode !== initialEpisode) {
+    setPrevInitialEpisode(initialEpisode)
+    setSelectedEpisode(initialEpisode)
+  }
+
+  // Set default season when data loads (during render, not in effect)
+  // Guard only on selectedSeason === undefined to avoid cached-reference bug (same as profiles above)
+  // Skip while stream_id deep link is resolving season/episode from the API
+  if (!hasStreamDeepLink && seasons.length > 0 && selectedSeason === undefined) {
+    setSelectedSeason(seasons[0].season_number)
+  }
+
+  // Drop stale season from URL/deep-link when it no longer exists (e.g. after delete or refresh)
+  if (seasons.length > 0 && selectedSeason !== undefined && !seasons.some((s) => s.season_number === selectedSeason)) {
+    setSelectedSeason(seasons[0].season_number)
+    setSelectedEpisode(undefined)
+  }
+
+  // Set default episode when season changes (during render, not in effect)
+  // Guard only on selectedEpisode === undefined to avoid cached-reference bug (same as profiles above)
+  if (!hasStreamDeepLink && episodes.length > 0 && selectedEpisode === undefined) {
+    setSelectedEpisode(episodes[0].episode_number)
+  }
+
+  // Resolve series season/episode from backend when deep-linking by stream_id (during render)
+  const resolvedDeepLinkSeason =
+    hasStreamDeepLink && streamsData ? (streamsData.resolved_season ?? streamsData.season) : undefined
+  const resolvedDeepLinkEpisode =
+    hasStreamDeepLink && streamsData ? (streamsData.resolved_episode ?? streamsData.episode) : undefined
+  const [prevResolvedDeepLinkSeason, setPrevResolvedDeepLinkSeason] = useState<number | undefined>()
+  const [prevResolvedDeepLinkEpisode, setPrevResolvedDeepLinkEpisode] = useState<number | undefined>()
+  if (
+    hasStreamDeepLink &&
+    catalogType === 'series' &&
+    resolvedDeepLinkSeason !== undefined &&
+    resolvedDeepLinkEpisode !== undefined &&
+    (prevResolvedDeepLinkSeason !== resolvedDeepLinkSeason || prevResolvedDeepLinkEpisode !== resolvedDeepLinkEpisode)
+  ) {
+    setPrevResolvedDeepLinkSeason(resolvedDeepLinkSeason)
+    setPrevResolvedDeepLinkEpisode(resolvedDeepLinkEpisode)
+    if (selectedSeason !== resolvedDeepLinkSeason) setSelectedSeason(resolvedDeepLinkSeason)
+    if (selectedEpisode !== resolvedDeepLinkEpisode) setSelectedEpisode(resolvedDeepLinkEpisode)
+    setSearchParams(
+      (prev) => {
+        const params = new URLSearchParams(prev)
+        params.set('season', String(resolvedDeepLinkSeason))
+        params.set('episode', String(resolvedDeepLinkEpisode))
+        return params
+      },
+      { replace: true },
+    )
+  }
+
+  // Reset deep-link state when stream_id changes (during render)
+  const [prevDeepLinkStreamId, setPrevDeepLinkStreamId] = useState(streamFilters.streamIdFilter)
+  if (streamFilters.streamIdFilter !== prevDeepLinkStreamId) {
+    setPrevDeepLinkStreamId(streamFilters.streamIdFilter)
+    setAutoOpenedStreamId(null)
+    setPrevResolvedDeepLinkSeason(undefined)
+    setPrevResolvedDeepLinkEpisode(undefined)
+  }
+
+  // Auto-open stream dialog when navigated with ?stream_id= (during render)
+  if (hasStreamDeepLink && autoOpenedStreamId !== streamFilters.streamIdFilter && streamsData?.streams) {
+    const match = streamsData.streams.find((s) => s.id !== undefined && String(s.id) === streamFilters.streamIdFilter)
+    if (match) {
+      setAutoOpenedStreamId(streamFilters.streamIdFilter)
+      if (selectedStream?.id !== match.id) setSelectedStream(match)
+      if (!streamDialogOpen) setStreamDialogOpen(true)
+    }
+  }
+
+  // Helper function for partial case-insensitive matching (for instant client-side filtering)
+  const matchesFilter = (value: string | undefined, filters: string[]): boolean => {
+    if (!value || filters.length === 0) return true
+    const valueLower = value.toLowerCase()
+    return filters.some((f) => {
+      const filterLower = f.toLowerCase()
+      return valueLower === filterLower || valueLower.includes(filterLower) || filterLower.includes(valueLower)
+    })
+  }
+
+  // Client-side filtering and sorting (catalog API returns unfiltered streams).
+  const filteredStreams = useMemo(() => {
+    if (!streamsData?.streams) return []
+
+    const proxyStreams = streamsData.streams.filter(isProxyStream)
+    let result = streamsData.streams.filter((stream) => !isProxyStream(stream))
+
+    // Privileged users (moderator+) see keyword-blocked streams; admins also see manually blocked ones.
+    if (!isModerator) {
+      result = result.filter((s) => !s.is_keyword_blocked)
+    }
+    if (!isAdmin) {
+      result = result.filter((s) => !s.is_blocked)
+    }
+
+    // Apply instant client-side filters (for UI responsiveness)
+    const {
+      qualityFilter,
+      resolutionFilter,
+      sourceFilter,
+      codecFilter,
+      languageFilter,
+      cachedFilter,
+      streamTypeFilter,
+      sortPriority,
+    } = streamFilters
+
+    if (qualityFilter.length > 0) {
+      result = result.filter((s) => matchesFilter(s.quality, qualityFilter))
+    }
+
+    if (resolutionFilter.length > 0) {
+      result = result.filter((s) => matchesFilter(s.resolution, resolutionFilter))
+    }
+
+    if (sourceFilter.length > 0) {
+      result = result.filter((s) => matchesFilter(s.source, sourceFilter))
+    }
+
+    if (languageFilter.length > 0) {
+      result = result.filter((s) => s.languages?.some((lang) => languageFilter.includes(lang)) ?? false)
+    }
+
+    if (codecFilter.length > 0) {
+      result = result.filter((s) => matchesFilter(s.codec, codecFilter))
+    }
+
+    // Apply stream type filter
+    if (streamTypeFilter.length > 0) {
+      result = result.filter((s) => {
+        if (!s.stream_type) return false
+        const streamType = s.stream_type.toLowerCase()
+        return streamTypeFilter.some((filterType) => {
+          // Handle various stream type naming conventions
+          if (filterType === 'torrent') return streamType === 'torrent'
+          if (filterType === 'usenet') return streamType === 'usenet'
+          if (filterType === 'telegram') return streamType === 'telegram'
+          if (filterType === 'http') return streamType === 'http' || streamType === 'web'
+          if (filterType === 'direct') return streamType === 'direct' || streamType === 'ddl'
+          return streamType === filterType
+        })
+      })
+    }
+
+    // Apply last played only filter
+    if (streamFilters.lastPlayedOnly && lastPlayedStreamId) {
+      result = result.filter((s) => s.id !== undefined && String(s.id) === lastPlayedStreamId)
+    }
+
+    // Apply cached filter
+    if (cachedFilter === 'cached') {
+      result = result.filter((s) => s.cached === true)
+    } else if (cachedFilter === 'not_cached') {
+      result = result.filter((s) => s.cached === false)
+    }
+
+    // Apply size filter
+    const { minSizeGB, maxSizeGB } = streamFilters
+    if (minSizeGB !== null || maxSizeGB !== null) {
+      const parseSizeToGB = (sizeStr?: string) => {
+        if (!sizeStr) return null
+        const match = sizeStr.match(/([\d.]+)\s*(GB|MB|KB|TB)/i)
+        if (!match) return null
+        const [, num, unit] = match
+        const multipliers: Record<string, number> = { KB: 1 / (1024 * 1024), MB: 1 / 1024, GB: 1, TB: 1024 }
+        return parseFloat(num) * (multipliers[unit.toUpperCase()] || 1)
+      }
+
+      result = result.filter((s) => {
+        const sizeGB = parseSizeToGB(s.size)
+        if (sizeGB === null) return true // Keep streams without size info
+        if (minSizeGB !== null && sizeGB < minSizeGB) return false
+        if (maxSizeGB !== null && sizeGB > maxSizeGB) return false
+        return true
+      })
+    }
+
+    // Apply infohash search filter
+    if (streamFilters.infoHashSearch.length > 0) {
+      const needle = streamFilters.infoHashSearch.toLowerCase()
+      result = result.filter((s) => s.info_hash?.toLowerCase().includes(needle) ?? false)
+    }
+
+    // Apply stream id filter (from contributions deep link)
+    if (streamFilters.streamIdFilter.length > 0) {
+      result = result.filter((s) => s.id !== undefined && String(s.id) === streamFilters.streamIdFilter)
+    }
+
+    // Apply multi-key sorting (priority order — first non-tie wins)
+    return [...proxyStreams, ...sortStreams(result, sortPriority)]
+  }, [streamsData, streamFilters, lastPlayedStreamId, isModerator, isAdmin])
+
+  const streamTotalPages = Math.max(1, Math.ceil(filteredStreams.length / streamPageSize))
+  const safeStreamPage = Math.min(streamPage, streamTotalPages)
+
+  const paginatedStreams = useMemo(() => {
+    const start = (safeStreamPage - 1) * streamPageSize
+    return filteredStreams.slice(start, start + streamPageSize)
+  }, [filteredStreams, safeStreamPage, streamPageSize])
+
+  const paginatedStreamIds = useMemo(
+    () => paginatedStreams.map((s) => s.id).filter((id): id is number => id !== undefined),
+    [paginatedStreams],
+  )
+
+  const communityStreamIds = useMemo(() => {
+    const ids = new Set(paginatedStreamIds)
+    if (selectedStream?.id) ids.add(selectedStream.id)
+    return [...ids]
+  }, [paginatedStreamIds, selectedStream?.id])
+
+  useEffect(() => {
+    setStreamPage(1)
+  }, [streamFilters, selectedSeason, selectedEpisode, selectedProvider, streamPageSize])
+
+  // Derive available filter options from streams
+  const availableSources = useMemo(() => {
+    if (!streamsData?.streams) return []
+    const sources = new Set(streamsData.streams.map((s) => s.source).filter(Boolean))
+    return Array.from(sources).sort() as string[]
+  }, [streamsData])
+
+  const availableResolutions = useMemo(() => {
+    if (!streamsData?.streams) return []
+    const resolutions = new Set(streamsData.streams.map((s) => s.resolution).filter(Boolean))
+    return Array.from(resolutions).sort() as string[]
+  }, [streamsData])
+
+  const availableQualities = useMemo(() => {
+    if (!streamsData?.streams) return []
+    const qualities = new Set(streamsData.streams.map((s) => s.quality).filter(Boolean))
+    return Array.from(qualities).sort() as string[]
+  }, [streamsData])
+
+  const availableCodecs = useMemo(() => {
+    if (!streamsData?.streams) return []
+    const codecs = new Set(streamsData.streams.map((s) => s.codec).filter(Boolean))
+    return Array.from(codecs).sort() as string[]
+  }, [streamsData])
+
+  const availableLanguages = useMemo(() => {
+    if (!streamsData?.streams) return []
+    const langs = new Set(streamsData.streams.flatMap((s) => s.languages ?? []).filter(Boolean))
+    return Array.from(langs).sort() as string[]
+  }, [streamsData])
+
+  const availableStreamTypes = useMemo(() => {
+    if (!streamsData?.streams) return []
+    const types = new Set(streamsData.streams.map((s) => s.stream_type).filter(Boolean))
+    return Array.from(types) as ('torrent' | 'usenet' | 'http')[]
+  }, [streamsData])
+
+  const handleLibraryToggle = async () => {
+    if (!id) return
+
+    if (libraryStatus?.in_library) {
+      await removeFromLibrary.mutateAsync(mediaId)
+    } else {
+      await addToLibrary.mutateAsync({
+        media_id: mediaId,
+        catalog_type: catalogType,
+      })
+    }
+  }
+
+  const handleStreamClick = (stream: CatalogStreamInfo) => {
+    setSelectedStream(stream)
+    setStreamDialogOpen(true)
+  }
+
+  const handleStreamFiltersChange = useCallback(
+    (filters: StreamFilterState) => {
+      setStreamFilters(filters)
+      const current = searchParams.get('stream_id') || ''
+      if (filters.streamIdFilter === current) return
+      const newParams = new URLSearchParams(searchParams)
+      if (filters.streamIdFilter) {
+        newParams.set('stream_id', filters.streamIdFilter)
+      } else {
+        newParams.delete('stream_id')
+      }
+      setSearchParams(newParams, { replace: true })
+    },
+    [searchParams, setSearchParams],
+  )
+
+  // Handle watch action - opens player at page level (outside of StreamActionDialog)
+  const handleWatchStream = useCallback(
+    (stream: CatalogStreamInfo, streamUrl: string, options?: { useTranscode?: boolean; rawUrl?: string }) => {
+      const transcodeUrl = canOfferTranscodeForStream(stream, streamUrl) ? buildTranscodeStreamUrl(streamUrl) : null
+      const shouldUseTranscode = Boolean(options?.useTranscode && transcodeUrl)
+      const finalStreamUrl = shouldUseTranscode && transcodeUrl ? transcodeUrl : streamUrl
+      // Use the raw (non-MediaFlow) URL for external players, copy, and download
+      const externalUrl = options?.rawUrl || streamUrl
+
+      setPlayerStream(stream)
+      setPlayerStreamUrl(finalStreamUrl)
+      setPlayerExternalStreamUrl(externalUrl)
+      setPlayerTranscodeStreamUrl(transcodeUrl)
+      setIsPlayingTranscodedStream(shouldUseTranscode)
+      setWatchHistoryId(null) // Reset history ID
+      setStartTime(0) // Reset start time
+      lastProgressUpdateRef.current = 0 // Reset progress throttle
+      watchTrackingStartedRef.current = false
+
+      // Save as last played stream
+      if (stream.id) {
+        const key = getLastPlayedKey()
+        const streamIdStr = String(stream.id)
+        localStorage.setItem(key, streamIdStr)
+        setLastPlayedStreamId(streamIdStr)
+      }
+
+      setPlayerOpen(true)
+    },
+    [getLastPlayedKey],
+  )
+
+  const handleSwitchToTranscode = useCallback(() => {
+    if (!playerTranscodeStreamUrl || isPlayingTranscodedStream) return
+
+    setPlayerStreamUrl(playerTranscodeStreamUrl)
+    setIsPlayingTranscodedStream(true)
+  }, [playerTranscodeStreamUrl, isPlayingTranscodedStream])
+
+  // Throttled progress update handler (every 10 seconds)
+  const handleTimeUpdate = useCallback(
+    (currentTime: number, duration: number) => {
+      if (currentTime > 0 && !watchHistoryId && !watchTrackingStartedRef.current && playerStream && item) {
+        watchTrackingStartedRef.current = true
+        void trackAction
+          .mutateAsync({
+            media_id: mediaId,
+            title: item.title,
+            catalog_type: catalogType === 'series' ? 'series' : catalogType === 'tv' ? 'tv' : 'movie',
+            season: selectedSeason,
+            episode: selectedEpisode,
+            action: 'watch',
+            stream_info: {
+              id: playerStream.id,
+              info_hash: playerStream.info_hash,
+              name: playerStream.name,
+              quality: playerStream.quality,
+              size: playerStream.size,
+              source: playerStream.source,
+            },
+          })
+          .then((historyItem) => {
+            setWatchHistoryId(historyItem.id)
+            if (historyItem.progress > 0) {
+              setStartTime(historyItem.progress)
+            }
+          })
+          .catch((err) => {
+            watchTrackingStartedRef.current = false
+            console.error('Failed to track watch action:', err)
+          })
+      }
+
+      const now = Date.now()
+      const timeSinceLastUpdate = now - lastProgressUpdateRef.current
+
+      // Only update every 10 seconds and if we have a history ID
+      if (watchHistoryId && timeSinceLastUpdate >= 10000) {
+        lastProgressUpdateRef.current = now
+
+        // Update progress in background (don't await)
+        updateProgress.mutate({
+          historyId: watchHistoryId,
+          data: {
+            progress: Math.floor(currentTime),
+            duration: duration > 0 ? Math.floor(duration) : undefined,
+          },
+        })
+      }
+    },
+    [
+      watchHistoryId,
+      playerStream,
+      item,
+      trackAction,
+      mediaId,
+      catalogType,
+      selectedSeason,
+      selectedEpisode,
+      updateProgress,
+    ],
+  )
+
+  // Save final progress when player closes and clear player state to fully unmount
+  const handlePlayerClose = useCallback((open: boolean) => {
+    if (!open) {
+      // Player is closing - clear player state so the component fully unmounts
+      // This stops all network activity (HLS retries, video buffering)
+      setPlayerOpen(false)
+      // Use a microtask to clear stream state after dialog close animation
+      setTimeout(() => {
+        setPlayerStream(null)
+        setPlayerStreamUrl(null)
+        setPlayerExternalStreamUrl(null)
+        setPlayerTranscodeStreamUrl(null)
+        setIsPlayingTranscodedStream(false)
+      }, 300)
+    } else {
+      setPlayerOpen(open)
+    }
+  }, [])
+
+  if (isLoading) {
+    return (
+      <div className="space-y-6">
+        <Skeleton className="h-8 w-32" />
+        <div className="grid lg:grid-cols-[300px_1fr] gap-8">
+          <Skeleton className="aspect-[2/3] rounded-2xl" />
+          <div className="space-y-4">
+            <Skeleton className="h-10 w-3/4" />
+            <Skeleton className="h-6 w-1/2" />
+            <Skeleton className="h-24 w-full" />
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  const libraryReturnTo = getContentDetailReturnUrl()
+  const returnLabel = getContentDetailReturnLabel()
+
+  if (!item) {
+    return (
+      <div className="text-center py-12">
+        <Film className="h-16 w-16 mx-auto text-muted-foreground opacity-50" />
+        <p className="mt-4 text-lg">Content not found</p>
+        <Button asChild className="mt-4 rounded-xl">
+          <Link to={libraryReturnTo}>
+            <ArrowLeft className="mr-2 h-4 w-4" />
+            Back to {returnLabel}
+          </Link>
+        </Button>
+      </div>
+    )
+  }
+
+  return (
+    <ContentLikesProvider mediaIds={mediaId ? [mediaId] : []}>
+      <StreamCommunityProvider streamIds={communityStreamIds}>
+        <div className="space-y-6">
+          {/* Back Button */}
+          <Button variant="ghost" asChild className="rounded-xl">
+            <Link to={libraryReturnTo}>
+              <ArrowLeft className="mr-2 h-4 w-4" />
+              Back to {returnLabel}
+            </Link>
+          </Button>
+
+          {/* Hero Section */}
+          <div className="relative overflow-hidden rounded-2xl">
+            {/* Background with RPDB backdrop support */}
+            <div className="absolute inset-0">
+              <Backdrop
+                metaId={item.external_ids?.imdb || `mf:${item.id}`}
+                backdrop={item.background}
+                rpdbApiKey={catalogType !== 'tv' ? rpdbApiKey : null}
+                className="absolute inset-0 w-full h-full object-cover"
+              />
+              <div className="absolute inset-0 bg-gradient-to-r from-background via-background/95 to-background/80" />
+            </div>
+
+            <div className="relative grid lg:grid-cols-[280px_1fr] gap-8 p-6 lg:p-8">
+              {/* Poster */}
+              <div className="mx-auto lg:mx-0">
+                <Poster
+                  metaId={item.external_ids?.imdb || `mf:${item.id}`}
+                  catalogType={catalogType === 'tv' ? 'tv' : catalogType}
+                  poster={item.poster}
+                  rpdbApiKey={catalogType !== 'tv' ? rpdbApiKey : null}
+                  title={item.title}
+                  className="w-[200px] lg:w-full rounded-2xl shadow-2xl"
+                />
+              </div>
+
+              {/* Info */}
+              <div className="space-y-4">
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <Badge variant="outline" className="text-xs">
+                      {catalogType === 'movie' ? 'Movie' : catalogType === 'series' ? 'Series' : 'TV'}
+                    </Badge>
+                    {item.year && <span className="text-sm text-muted-foreground">{item.year}</span>}
+                    {item.is_blocked && (
+                      <Badge variant="destructive" className="text-xs gap-1">
+                        <Ban className="h-3 w-3" />
+                        Blocked
+                      </Badge>
+                    )}
+                    {item.is_keyword_blocked && !item.keyword_block_override && (
+                      <Badge className="text-xs gap-1 bg-orange-500/20 text-orange-400 border border-orange-500/30">
+                        <Ban className="h-3 w-3" />
+                        Keyword Blocked
+                      </Badge>
+                    )}
+                    {item.is_keyword_blocked && item.keyword_block_override && (
+                      <Badge className="text-xs gap-1 bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
+                        <ShieldCheck className="h-3 w-3" />
+                        Keyword Overridden
+                      </Badge>
+                    )}
+                  </div>
+                  <h1 className="text-3xl lg:text-4xl font-bold">
+                    {item.is_keyword_blocked && item.matched_keywords?.length
+                      ? highlightKeywords(item.title, item.matched_keywords)
+                      : item.title}
+                  </h1>
+                </div>
+
+                {/* Meta Info */}
+                <div className="flex flex-wrap items-center gap-4 text-sm text-muted-foreground">
+                  {/* Multi-provider ratings */}
+                  {item.ratings?.external_ratings && item.ratings.external_ratings.length > 0 ? (
+                    <RatingsDisplay
+                      ratings={item.ratings}
+                      size="default"
+                      maxExternalRatings={5}
+                      showCommunity={false} // Community shown separately below
+                    />
+                  ) : (
+                    item.imdb_rating && (
+                      <div className="flex items-center gap-1">
+                        <Star className="h-4 w-4 fill-primary text-primary" />
+                        <span className="font-medium text-foreground">{item.imdb_rating.toFixed(1)}</span>
+                        <span>/ 10</span>
+                      </div>
+                    )
+                  )}
+                  {/* Content Guidance (Certification & Nudity) */}
+                  <ContentGuidance certification={item.certification} nudity={item.nudity} size="default" />
+                  {item.runtime && (
+                    <div className="flex items-center gap-1">
+                      <Clock className="h-4 w-4" />
+                      <span>{item.runtime}</span>
+                    </div>
+                  )}
+                  {item.year && (
+                    <div className="flex items-center gap-1">
+                      <Calendar className="h-4 w-4" />
+                      <span>{item.year}</span>
+                    </div>
+                  )}
+                </div>
+
+                {/* Genres - clickable to filter */}
+                {(item.genres?.length ?? 0) > 0 && (
+                  <div className="flex flex-wrap gap-2">
+                    {item.genres?.map((genre) => (
+                      <Link key={genre} to={`/dashboard/library?tab=browse&genre=${encodeURIComponent(genre)}`}>
+                        <Badge
+                          variant="secondary"
+                          className="rounded-lg hover:bg-primary/20 hover:text-primary cursor-pointer transition-colors"
+                        >
+                          {genre}
+                        </Badge>
+                      </Link>
+                    ))}
+                  </div>
+                )}
+
+                {/* Description */}
+                {item.description && (
+                  <p className="text-muted-foreground leading-relaxed max-w-2xl">
+                    {item.is_keyword_blocked && item.matched_keywords?.length
+                      ? highlightKeywords(item.description, item.matched_keywords)
+                      : item.description}
+                  </p>
+                )}
+
+                {/* Credits (Directors, Writers, Cast) */}
+                {(item.directors?.length || item.writers?.length || item.cast?.length) && (
+                  <div className="grid gap-3 text-sm max-w-2xl">
+                    {item.directors && item.directors.length > 0 && (
+                      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                        <span className="text-muted-foreground font-medium">
+                          Director{item.directors.length > 1 ? 's' : ''}:
+                        </span>
+                        {item.directors.map((director, idx) => (
+                          <Link
+                            key={director}
+                            to={`/dashboard/library?tab=browse&type=${catalogType}&search=${encodeURIComponent(director)}`}
+                            className="hover:text-primary transition-colors"
+                          >
+                            {director}
+                            {idx < item.directors!.length - 1 ? ',' : ''}
+                          </Link>
+                        ))}
+                      </div>
+                    )}
+                    {item.writers && item.writers.length > 0 && (
+                      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                        <span className="text-muted-foreground font-medium">
+                          Writer{item.writers.length > 1 ? 's' : ''}:
+                        </span>
+                        {item.writers.slice(0, 5).map((writer, idx) => (
+                          <Link
+                            key={writer}
+                            to={`/dashboard/library?tab=browse&type=${catalogType}&search=${encodeURIComponent(writer)}`}
+                            className="hover:text-primary transition-colors"
+                          >
+                            {writer}
+                            {idx < Math.min(item.writers!.length, 5) - 1 ? ',' : ''}
+                          </Link>
+                        ))}
+                        {item.writers.length > 5 && (
+                          <span className="text-muted-foreground">+{item.writers.length - 5} more</span>
+                        )}
+                      </div>
+                    )}
+                    {item.cast && item.cast.length > 0 && (
+                      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                        <span className="text-muted-foreground font-medium">Cast:</span>
+                        {item.cast.slice(0, 8).map((actor, idx) => (
+                          <Link
+                            key={actor}
+                            to={`/dashboard/library?tab=browse&type=${catalogType}&search=${encodeURIComponent(actor)}`}
+                            className="hover:text-primary transition-colors"
+                          >
+                            {actor}
+                            {idx < Math.min(item.cast!.length, 8) - 1 ? ',' : ''}
+                          </Link>
+                        ))}
+                        {item.cast.length > 8 && (
+                          <span className="text-muted-foreground">+{item.cast.length - 8} more</span>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Actions */}
+                <div className="flex flex-wrap gap-3 pt-2">
+                  {/* Trailer Button - shown if trailers available */}
+                  {item.trailers && item.trailers.length > 0 && (
+                    <TrailerButton trailers={item.trailers} title={item.title} />
+                  )}
+
+                  {isAuthenticated && (
+                    <Button
+                      variant="outline"
+                      onClick={handleLibraryToggle}
+                      disabled={addToLibrary.isPending || removeFromLibrary.isPending}
+                      className="rounded-xl"
+                    >
+                      {addToLibrary.isPending || removeFromLibrary.isPending ? (
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      ) : libraryStatus?.in_library ? (
+                        <HeartOff className="mr-2 h-4 w-4" />
+                      ) : (
+                        <Heart className="mr-2 h-4 w-4" />
+                      )}
+                      {libraryStatus?.in_library ? 'Remove from Library' : 'Add to Library'}
+                    </Button>
+                  )}
+                </div>
+
+                {/* Metadata Voting & Edit */}
+                {isAuthenticated && mediaId && (
+                  <div className="pt-4 border-t border-border/30 mt-4">
+                    <div className="flex flex-wrap items-center gap-4">
+                      <ContentLikesBadge mediaId={mediaId} />
+                      <MetadataActions mediaId={mediaId} />
+                      <MetadataEditSheet mediaId={mediaId} catalogType={catalogType} />
+                      {/* RefreshMetadataButton only for movies/series - TV channels don't have IMDb IDs */}
+                      {(catalogType === 'movie' || catalogType === 'series') && (
+                        <RefreshMetadataButton
+                          mediaId={mediaId}
+                          externalIds={item.external_ids}
+                          mediaType={catalogType}
+                          title={item.title}
+                          year={item.year}
+                        />
+                      )}
+                      {/* ScrapeContentButton for movies/series - triggers stream scraping */}
+                      {(catalogType === 'movie' || catalogType === 'series') && (
+                        <ScrapeContentButton
+                          mediaId={mediaId}
+                          mediaType={catalogType}
+                          title={item.title}
+                          season={catalogType === 'series' ? selectedSeason : undefined}
+                          episode={catalogType === 'series' ? selectedEpisode : undefined}
+                        />
+                      )}
+                      {/* Block/Unblock button - moderators and admins only */}
+                      {isModerator && (
+                        <BlockContentButton
+                          mediaId={mediaId}
+                          mediaTitle={item.title}
+                          mediaType={catalogType}
+                          isBlocked={item.is_blocked || false}
+                          blockReason={item.block_reason}
+                        />
+                      )}
+                      {isAdmin && (
+                        <DeleteContentButton mediaId={mediaId} mediaTitle={item.title} mediaType={catalogType} />
+                      )}
+                    </div>
+                    {(item.last_refreshed_at || item.last_scraped_at) && (
+                      <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground mt-2">
+                        {item.last_refreshed_at && (
+                          <p>
+                            Metadata refreshed:{' '}
+                            {new Date(item.last_refreshed_at).toLocaleDateString(undefined, {
+                              year: 'numeric',
+                              month: 'short',
+                              day: 'numeric',
+                              hour: '2-digit',
+                              minute: '2-digit',
+                            })}
+                          </p>
+                        )}
+                        {item.last_scraped_at && (
+                          <p>
+                            Streams scraped:{' '}
+                            {new Date(item.last_scraped_at).toLocaleDateString(undefined, {
+                              year: 'numeric',
+                              month: 'short',
+                              day: 'numeric',
+                              hour: '2-digit',
+                              minute: '2-digit',
+                            })}
+                          </p>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* NSFW poster flag — visible to all users; review controls for admins */}
+                {item.poster_nsfw_flagged != null && item.poster_nsfw_score != null && (
+                  <NsfwStatusSection
+                    mediaId={mediaId}
+                    score={item.poster_nsfw_score}
+                    flagged={item.poster_nsfw_flagged}
+                    reviewed={item.poster_nsfw_reviewed ?? false}
+                    isAdmin={isAdmin}
+                  />
+                )}
+
+                {/* Keyword block override — moderator/admin, shown when keyword-blocked */}
+                {item.is_keyword_blocked && isModerator && (
+                  <KeywordOverrideSection
+                    mediaId={mediaId}
+                    isOverridden={item.keyword_block_override ?? false}
+                    canOverride={isModerator}
+                    onSuccess={() => {
+                      queryClient.invalidateQueries({ queryKey: ['catalog', catalogType, mediaId.toString()] })
+                      queryClient.invalidateQueries({ queryKey: ['admin', 'blocked-media'] })
+                    }}
+                  />
+                )}
+
+                {/* External IDs */}
+                {item.external_ids && (
+                  <div className="pt-4 border-t border-border/30">
+                    <p className="text-xs text-muted-foreground mb-2 font-medium">External IDs</p>
+                    <ExternalIdsDisplay externalIds={item.external_ids} mediaType={catalogType} />
+                  </div>
+                )}
+
+                {/* Catalogs */}
+                {item.catalogs && item.catalogs.length > 0 && (
+                  <div className="pt-4 border-t border-border/30">
+                    <p className="text-xs text-muted-foreground mb-2 font-medium">Catalogs</p>
+                    <div className="flex flex-wrap gap-1.5">
+                      {item.catalogs.map((catalog) => (
+                        <Badge key={catalog} variant="secondary" className="rounded-lg text-xs capitalize">
+                          {catalog.replace(/_/g, ' ')}
+                        </Badge>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* AKA Titles */}
+                {item.aka_titles && item.aka_titles.length > 0 && (
+                  <div className="pt-4">
+                    <p className="text-xs text-muted-foreground">
+                      Also known as: {item.aka_titles.slice(0, 3).join(', ')}
+                      {item.aka_titles.length > 3 && ` +${item.aka_titles.length - 3} more`}
+                    </p>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {isAuthenticated && (catalogType === 'movie' || catalogType === 'series') && (
+            <MediaStreamImport
+              ref={mediaImportRef}
+              onBusyChange={setIsImportBusy}
+              key={item.id}
+              item={item}
+              selectedSeason={selectedSeason}
+              selectedEpisode={selectedEpisode}
+              onImported={() => {
+                void refetchCatalogItem()
+                void queryClient.invalidateQueries({
+                  queryKey: ['catalog', 'streams', catalogType, mediaId.toString()],
+                })
+              }}
+            />
+          )}
+
+          {/* Series Season/Episode Selector */}
+          {catalogType === 'series' && (
+            <div className="space-y-3">
+              {isAdmin && (
+                <div className="flex justify-end">
+                  <SeriesEpisodeCreator
+                    mediaId={item.id}
+                    seasons={seasons}
+                    onCreated={async (season, episode) => {
+                      await refetchCatalogItem()
+                      setSelectedSeason(season)
+                      setSelectedEpisode(episode)
+                    }}
+                  />
+                </div>
+              )}
+              {seasons.length > 0 ? (
+                <SeriesEpisodePicker
+                  seasons={seasons}
+                  selectedSeason={selectedSeason}
+                  selectedEpisode={selectedEpisode}
+                  onSeasonChange={(season) => {
+                    setSelectedSeason(season)
+                    setSelectedEpisode(undefined)
+                  }}
+                  onEpisodeChange={setSelectedEpisode}
+                  isImportBusy={isImportBusy}
+                  onEpisodeImport={
+                    isAuthenticated
+                      ? (files, season, episode) => {
+                          setSelectedSeason(season)
+                          setSelectedEpisode(episode)
+                          mediaImportRef.current?.importFiles(files, season, episode)
+                        }
+                      : undefined
+                  }
+                  isAdmin={isAdmin}
+                  onDeleteEpisode={handleDeleteEpisode}
+                  isDeletingEpisode={deleteEpisodeAdmin.isPending}
+                  onDeleteSeason={handleDeleteSeason}
+                  isDeletingSeason={deleteSeasonAdmin.isPending}
+                  onBulkDeleteSeasons={isAdmin ? handleBulkDeleteSeasons : undefined}
+                  onBulkDeleteEpisodes={isAdmin ? handleBulkDeleteEpisodes : undefined}
+                  isBulkDeleting={bulkDeleteSeasonsAdmin.isPending || bulkDeleteEpisodesAdmin.isPending}
+                  onEpisodeEditSuccess={handleEpisodeEditSuccess}
+                />
+              ) : (
+                <Card className="glass border-dashed border-border/60">
+                  <CardContent className="py-8 text-center text-sm text-muted-foreground">
+                    No seasons or episodes are stored yet. Refresh from TMDB, or add the missing entries above.
+                  </CardContent>
+                </Card>
+              )}
+            </div>
+          )}
+
+          {/* Streams Section */}
+          {isAuthenticated &&
+            (catalogType === 'movie' ||
+              catalogType === 'tv' ||
+              (selectedSeason !== undefined && selectedEpisode !== undefined)) && (
+              <Card className="glass border-border/50">
+                <CardHeader className="px-3 sm:px-6 py-4 sm:py-6">
+                  <div className="flex flex-col gap-3 sm:gap-4">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <CardTitle className="text-base sm:text-lg flex items-center gap-2">
+                          <Play className="h-4 w-4 sm:h-5 sm:w-5 text-primary shrink-0" />
+                          Available Streams
+                        </CardTitle>
+                        <CardDescription className="text-xs sm:text-sm mt-0.5">
+                          {catalogType === 'series'
+                            ? `Season ${selectedSeason}, Episode ${selectedEpisode}`
+                            : catalogType === 'tv'
+                              ? 'Select a stream to watch this channel'
+                              : 'Select a stream to watch or download'}
+                        </CardDescription>
+                      </div>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        {/* Profile Selector - show when multiple profiles available */}
+                        {profiles && profiles.length > 1 ? (
+                          <Select
+                            value={selectedProfileId?.toString() ?? ''}
+                            onValueChange={(value) => {
+                              const newProfileId = parseInt(value, 10)
+                              const newProfile = profiles.find((p) => p.id === newProfileId)
+                              setSelectedProfileId(newProfileId)
+                              setSelectedProfileUuid(newProfile?.uuid)
+                              // Set the primary provider from the new profile
+                              setSelectedProvider(newProfile?.streaming_providers?.primary_service || undefined)
+                            }}
+                          >
+                            <SelectTrigger className="w-[130px] sm:w-[160px] h-9 rounded-xl text-xs sm:text-sm">
+                              <SelectValue placeholder="Profile" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {profiles.map((profile) => (
+                                <SelectItem key={profile.id} value={profile.id.toString()}>
+                                  <div className="flex items-center gap-2">
+                                    <span>{profile.name}</span>
+                                    {profile.is_default && (
+                                      <Badge variant="secondary" className="text-[10px] px-1 py-0">
+                                        Default
+                                      </Badge>
+                                    )}
+                                  </div>
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        ) : profiles && profiles.length === 1 ? (
+                          // Show single profile name as a badge
+                          <Badge
+                            variant="outline"
+                            className="rounded-lg px-2.5 sm:px-3 py-1.5 h-9 flex items-center text-xs sm:text-sm"
+                          >
+                            {profiles[0].name}
+                          </Badge>
+                        ) : null}
+                        <ViewModeToggle mode={viewMode} onModeChange={setViewMode} />
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => refetchStreams()}
+                          disabled={streamsLoading}
+                          className="rounded-xl h-9 text-xs sm:text-sm"
+                        >
+                          {streamsLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Refresh'}
+                        </Button>
+                      </div>
+                    </div>
+
+                    {/* Provider Tabs - show when providers available */}
+                    {availableProviders.length > 0 &&
+                      (availableProviders.length > 1 ? (
+                        <Tabs
+                          value={selectedProvider || availableProviders[0]?.service}
+                          onValueChange={(value) => setSelectedProvider(value)}
+                          className="w-full"
+                        >
+                          <TabsList className="w-full justify-start h-auto flex-wrap gap-1 bg-muted/50 p-1 rounded-xl">
+                            {availableProviders.map((provider) => (
+                              <TabsTrigger
+                                key={provider.service}
+                                value={provider.service}
+                                className="rounded-lg data-[state=active]:bg-primary data-[state=active]:text-primary-foreground px-2 sm:px-3 py-1 sm:py-1.5 text-xs sm:text-sm"
+                              >
+                                {getProviderDisplayName(provider)}
+                              </TabsTrigger>
+                            ))}
+                          </TabsList>
+                        </Tabs>
+                      ) : (
+                        // Show single provider as a badge
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm text-muted-foreground">Provider:</span>
+                          <Badge variant="secondary" className="rounded-lg px-3 py-1">
+                            {getProviderDisplayName(availableProviders[0])}
+                          </Badge>
+                        </div>
+                      ))}
+
+                    {/* Filters and Sorting */}
+                    {streamsData?.streams && streamsData.streams.length > 0 && (
+                      <StreamFilters
+                        filters={streamFilters}
+                        onFiltersChange={handleStreamFiltersChange}
+                        availableSources={availableSources}
+                        availableResolutions={availableResolutions}
+                        availableQualities={availableQualities}
+                        availableCodecs={availableCodecs}
+                        availableLanguages={availableLanguages}
+                        availableStreamTypes={availableStreamTypes}
+                        totalStreams={streamsData?.streams?.length || 0}
+                        filteredCount={filteredStreams.length}
+                        showCachedFilter={availableProviders.length > 0}
+                        hasLastPlayed={!!lastPlayedStreamId}
+                      />
+                    )}
+                  </div>
+                </CardHeader>
+                <CardContent className="px-3 sm:px-6">
+                  {/* Banner shown when navigated from Discover */}
+                  {scrapingBanner && (
+                    <div
+                      className={`flex items-start gap-3 rounded-xl border px-4 py-3 mb-4 text-sm ${scrapeResult ? 'border-border bg-muted/40' : 'border-primary/30 bg-primary/5'}`}
+                    >
+                      {autoScrapeMutation.isPending ? (
+                        <Loader2 className="h-4 w-4 animate-spin text-primary shrink-0 mt-0.5" />
+                      ) : (
+                        <Info className="h-4 w-4 text-muted-foreground shrink-0 mt-0.5" />
+                      )}
+                      <div className="flex-1 min-w-0">
+                        {autoScrapeMutation.isPending ? (
+                          <>
+                            <p className="font-medium">Searching for streams…</p>
+                            <p className="text-muted-foreground text-xs">
+                              Scanning indexers, this may take up to a minute.
+                            </p>
+                          </>
+                        ) : scrapeResult ? (
+                          <>
+                            <p className="font-medium">
+                              Scraping complete — {scrapeResult.streams_found} stream
+                              {scrapeResult.streams_found !== 1 ? 's' : ''} found
+                            </p>
+                            {scrapeResult.scrapers_used.length > 0 && (
+                              <p className="text-muted-foreground text-xs mt-0.5">
+                                Used: {scrapeResult.scrapers_used.join(', ')}
+                              </p>
+                            )}
+                            {scrapeResult.streams_found === 0 && (
+                              <p className="text-muted-foreground text-xs mt-0.5">
+                                No streams were found. Try again later or check your indexer configuration.
+                              </p>
+                            )}
+                          </>
+                        ) : (
+                          <>
+                            <p className="font-medium">Searching for streams…</p>
+                            <p className="text-muted-foreground text-xs">
+                              Scanning indexers, this may take up to a minute.
+                            </p>
+                          </>
+                        )}
+                      </div>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-7 w-7 shrink-0"
+                        onClick={() => setScrapingBanner(false)}
+                      >
+                        <X className="h-4 w-4" />
+                      </Button>
+                    </div>
+                  )}
+                  {streamsLoading ? (
+                    <div className="space-y-3">
+                      {[...Array(5)].map((_, i) => (
+                        <Skeleton key={i} className="h-20 rounded-xl" />
+                      ))}
+                    </div>
+                  ) : !streamsData?.streams.length ? (
+                    <div className="text-center py-8">
+                      <Wifi className="h-12 w-12 mx-auto text-muted-foreground opacity-50" />
+                      <p className="mt-4 text-muted-foreground">No streams available</p>
+                      <p className="text-sm text-muted-foreground mt-2">
+                        Make sure you have a streaming provider configured
+                      </p>
+                    </div>
+                  ) : filteredStreams.length === 0 ? (
+                    <div className="text-center py-8">
+                      <Wifi className="h-12 w-12 mx-auto text-muted-foreground opacity-50" />
+                      <p className="mt-4 text-muted-foreground">No streams match your filters</p>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="mt-4 rounded-xl"
+                        onClick={() => handleStreamFiltersChange(defaultStreamFilters)}
+                      >
+                        Clear Filters
+                      </Button>
+                    </div>
+                  ) : (
+                    <div className="space-y-4">
+                      <ListPagination
+                        inputId="stream-page-jump-top"
+                        currentPage={safeStreamPage}
+                        totalPages={streamTotalPages}
+                        totalItems={filteredStreams.length}
+                        pageSize={streamPageSize}
+                        onPageChange={setStreamPage}
+                        alwaysShowSummary
+                        pageSizeOptions={[25, 50, 100]}
+                        onPageSizeChange={(size) => setStreamPageSize(size as 25 | 50 | 100)}
+                      />
+                      {viewMode === 'grouped' ? (
+                        <StreamGroupedList
+                          streams={paginatedStreams}
+                          groupBy="quality"
+                          renderStream={(stream, index) =>
+                            isProxyStream(stream) ? (
+                              <ProxyStreamCard
+                                key={`proxy-${index}`}
+                                stream={stream}
+                                onPlay={() =>
+                                  handleWatchStream(stream, stream.browser_url || stream.url!, { rawUrl: stream.url })
+                                }
+                              />
+                            ) : (
+                              <StreamCard
+                                key={stream.id || index}
+                                stream={stream}
+                                onClick={() => handleStreamClick(stream as CatalogStreamInfo)}
+                                mediaType={catalogType === 'series' ? 'series' : 'movie'}
+                                mediaId={mediaId}
+                                isLastPlayed={
+                                  stream.id !== undefined &&
+                                  (String(stream.id) === lastPlayedStreamId ||
+                                    String(stream.id) === streamFilters.streamIdFilter)
+                                }
+                              />
+                            )
+                          }
+                        />
+                      ) : (
+                        <div className="space-y-3">
+                          {paginatedStreams.map((stream, index) =>
+                            isProxyStream(stream) ? (
+                              <ProxyStreamCard
+                                key={`proxy-${index}`}
+                                stream={stream}
+                                onPlay={() =>
+                                  handleWatchStream(stream, stream.browser_url || stream.url!, { rawUrl: stream.url })
+                                }
+                              />
+                            ) : (
+                              <StreamCard
+                                key={stream.id || index}
+                                stream={stream}
+                                onClick={() => handleStreamClick(stream as CatalogStreamInfo)}
+                                mediaType={catalogType === 'series' ? 'series' : 'movie'}
+                                mediaId={mediaId}
+                                isLastPlayed={
+                                  stream.id !== undefined &&
+                                  (String(stream.id) === lastPlayedStreamId ||
+                                    String(stream.id) === streamFilters.streamIdFilter)
+                                }
+                              />
+                            ),
+                          )}
+                        </div>
+                      )}
+                      <ListPagination
+                        inputId="stream-page-jump-bottom"
+                        currentPage={safeStreamPage}
+                        totalPages={streamTotalPages}
+                        totalItems={filteredStreams.length}
+                        pageSize={streamPageSize}
+                        onPageChange={setStreamPage}
+                        alwaysShowSummary
+                        pageSizeOptions={[25, 50, 100]}
+                        onPageSizeChange={(size) => setStreamPageSize(size as 25 | 50 | 100)}
+                      />
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            )}
+
+          {/* Login prompt for anonymous users */}
+          {!isAuthenticated && (
+            <Card className="glass border-border/50">
+              <CardContent className="py-8 text-center">
+                <Play className="h-12 w-12 mx-auto text-muted-foreground opacity-50" />
+                <p className="mt-4 font-medium">Sign in to view streams</p>
+                <p className="text-sm text-muted-foreground mt-2">
+                  You need to be logged in with a configured streaming provider to access streams
+                </p>
+                <Button asChild className="mt-4 rounded-xl">
+                  <Link to="/login">Sign In</Link>
+                </Button>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* Stream Action Dialog */}
+          <StreamActionDialog
+            open={streamDialogOpen}
+            onOpenChange={setStreamDialogOpen}
+            stream={selectedStream}
+            mediaId={mediaId}
+            title={item.title}
+            catalogType={catalogType === 'series' ? 'series' : catalogType === 'tv' ? 'tv' : 'movie'}
+            season={selectedSeason}
+            episode={selectedEpisode}
+            selectedProvider={streamsData?.selected_provider}
+            hasMediaflowProxy={streamsData?.web_playback_enabled || false}
+            onStreamDeleted={() => refetchStreams()}
+            onWatch={handleWatchStream}
+          />
+
+          {/* Video Player Dialog (rendered at page level to avoid nested dialog issues) */}
+          {playerStream && playerStreamUrl && (
+            <PlayerDialog
+              open={playerOpen}
+              onOpenChange={handlePlayerClose}
+              stream={{
+                id: playerStream.id ? String(playerStream.id) : undefined,
+                name: playerStream.name,
+                title: playerStream.stream_name,
+                url: playerStreamUrl,
+                ytId: playerStream.yt_id || playerStream.ytId,
+                streamType: playerStream.stream_type,
+                quality: playerStream.quality,
+                resolution: playerStream.resolution,
+                size: playerStream.size,
+                source: playerStream.source,
+                codec: playerStream.codec,
+                audio: Array.isArray(playerStream.audio_formats)
+                  ? playerStream.audio_formats.join('|')
+                  : playerStream.audio_formats,
+                behaviorHints: playerStream.behavior_hints,
+              }}
+              externalStreamUrl={playerExternalStreamUrl || playerStreamUrl}
+              transcodeStreamUrl={playerTranscodeStreamUrl}
+              isTranscodedPlayback={isPlayingTranscodedStream}
+              onSwitchToTranscode={handleSwitchToTranscode}
+              contentTitle={item.title}
+              startTime={startTime}
+              onTimeUpdate={handleTimeUpdate}
+              onEnded={() => handlePlayerClose(false)}
+            />
+          )}
+        </div>
+      </StreamCommunityProvider>
+    </ContentLikesProvider>
+  )
+}
