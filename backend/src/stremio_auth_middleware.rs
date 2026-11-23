@@ -18,6 +18,7 @@ const STREMIO_USER_ROUTE_PREFIXES: &[&str] = &[
     "manifest.json",
     "configure",
     "kodi",
+    "subtitles",
 ];
 
 /// Middleware for all Stremio `/{secret_str}/...` routes.

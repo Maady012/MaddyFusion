@@ -1,0 +1,23 @@
+name: Keep-Alive Ping (Zero Cold Starts)
+
+on:
+  schedule:
+    # Run every 10 minutes to prevent Render free tier from sleeping
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    name: Ping MaddyFusion Service
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Warmup HTTP Request
+        run: |
+          echo "Pinging MaddyFusion live service to maintain zero cold starts..."
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -m 15 https://maddyfusion-stream.onrender.com/manifest.json)
+          echo "Warmup ping completed with HTTP status: $STATUS"
+          if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 400 ]; then
+            echo "Service is awake, fast, and healthy!"
+          else
+            echo "Service wake triggered."
+          fi

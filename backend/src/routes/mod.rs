@@ -31,6 +31,7 @@ pub mod poster;
 pub mod profiles;
 pub mod rss;
 pub mod stream;
+pub mod subtitles;
 pub mod streaming_provider;
 pub mod telegram_playback;
 pub mod telegram_session;
@@ -186,6 +187,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/{secret_str}/stream/movie/{video_id}", get(stream::movie))
         .route("/{secret_str}/stream/series/{video_id}", get(stream::series))
         .route("/{secret_str}/stream/tv/{video_id}", get(stream::tv))
+        // ── Subtitles ────────────────────────────────────────────────────────
+        .route("/subtitles/{media_type}/{video_id}", get(subtitles::public_subtitles))
+        .route("/{secret_str}/subtitles/{media_type}/{video_id}", get(subtitles::user_subtitles))
         // ── Poster ───────────────────────────────────────────────────────────
         .route("/poster/{media_type}/{id_jpg}", get(poster::handler))
         // ── Kodi stream (with pagination) ─────────────────────────────────────
