@@ -1,0 +1,82 @@
+[
+  {
+    "key": "SECRET_KEY",
+    "value": "f5ef55cd8577bec2aad21018f1dec897b8c0b2983747cda2aed35207f04e09b4"
+  },
+  {
+    "key": "API_PASSWORD",
+    "value": "078daf79f8f5a4274d35caee97c95a37"
+  },
+  {
+    "key": "HOST_URL",
+    "value": "https://mf-stream-private.onrender.com"
+  },
+  {
+    "key": "POSTER_HOST_URL",
+    "value": "https://mf-stream-private.onrender.com"
+  },
+  {
+    "key": "ADDON_NAME",
+    "value": "MaddyFusion"
+  },
+  {
+    "key": "ADDON_DESCRIPTION",
+    "value": "MaddyFusion \u2014 personalized stream addon for Nuvio & Stremio"
+  },
+  {
+    "key": "PORT",
+    "value": "8000"
+  },
+  {
+    "key": "STREAM_RS_PORT",
+    "value": "8000"
+  },
+  {
+    "key": "DISABLE_ROBOTS",
+    "value": "true"
+  },
+  {
+    "key": "ROBOTS_TXT",
+    "value": "User-agent: *\nDisallow: /"
+  },
+  {
+    "key": "ENABLE_CRAWLER",
+    "value": "false"
+  },
+  {
+    "key": "PROWLARR_SEARCH_INTERVAL_HOUR",
+    "value": "0"
+  },
+  {
+    "key": "VERSION",
+    "value": "6.2.0-maddy"
+  },
+  {
+    "key": "IS_SCRAP_FROM_TORRENTIO",
+    "value": "true"
+  },
+  {
+    "key": "IS_SCRAP_FROM_PUBLIC_INDEXERS",
+    "value": "true"
+  },
+  {
+    "key": "IS_SCRAP_FROM_MEDIAFUSION",
+    "value": "true"
+  },
+  {
+    "key": "TORRENTIO_SEARCH_INTERVAL_DAYS",
+    "value": "1"
+  },
+  {
+    "key": "TORBOX_SEARCH_INTERVAL_DAYS",
+    "value": "1"
+  },
+  {
+    "key": "PROWLARR_LIVE_TITLE_SEARCH",
+    "value": "true"
+  },
+  {
+    "key": "CACHE_VERSION",
+    "value": "maddyfusion-v2"
+  }
+]
