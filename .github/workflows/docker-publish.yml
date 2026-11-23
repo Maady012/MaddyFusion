@@ -3,13 +3,13 @@ name: Build & Push MaddyFusion Image
 on:
   push:
     branches:
-      - custom-prod
+      - main
   workflow_dispatch:
 
 jobs:
   build:
     name: Build & Publish to GHCR
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
@@ -18,24 +18,43 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Rust
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.85.0
+          toolchain: stable
+          targets: x86_64-unknown-linux-gnu
 
-      - name: Set up cargo cache
+      - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: backend
 
-      - name: Build Rust release binary
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: '10'
+
+      - name: Build frontend
+        run: |
+          cd clients/frontend
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      - name: Build Rust binaries
+        env:
+          SQLX_OFFLINE: "true"
         run: |
           cd backend
-          cargo build --release --bin mediafusion-api
+          cargo build --release --features tls-native,embed-frontend --target x86_64-unknown-linux-gnu --bin mediafusion-api
+          cargo build --release --features tls-native,nsfw-classifier --target x86_64-unknown-linux-gnu --bin mediafusion-worker
           mkdir -p ../rust-dist/amd64
-          cp target/release/mediafusion-api ../rust-dist/amd64/mediafusion-api
-          # Worker placeholder to satisfy multi-binary Dockerfile
-          cp target/release/mediafusion-api ../rust-dist/amd64/mediafusion-worker
+          cp target/x86_64-unknown-linux-gnu/release/mediafusion-api ../rust-dist/amd64/mediafusion-api
+          cp target/x86_64-unknown-linux-gnu/release/mediafusion-worker ../rust-dist/amd64/mediafusion-worker
           cd ..
 
       - name: Set up Docker Buildx
@@ -66,4 +85,4 @@ jobs:
             VERSION=6.2.0-maddy
           tags: |
             ${{ steps.image_name.outputs.image }}:latest
-            ${{ steps.image_name.outputs.image }}:custom-prod
+            ${{ steps.image_name.outputs.image }}:main
