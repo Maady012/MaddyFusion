@@ -266,6 +266,7 @@ fn build_manifest(
     if user_data.enable_catalogs || !user_data.watchlist_providers().is_empty() {
         resources.push(json!("catalog"));
     }
+    resources.push(json!("subtitles"));
     resources.push(json!({
         "name": "stream",
         "types": ["movie","series","tv","events"],
